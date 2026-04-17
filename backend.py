@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-AI-Based CNC Machine Status Monitor — Backend
-Monitors indicator lights from a surveillance camera feed to classify
-the state of 10 CNC machines in real time.
+CNC Machine Monitor — Multi-Camera Edition
+Connects to all 4 CNC floor cameras simultaneously.
+Detects indicator lights via blob detection (no fixed ROI boxes).
+Counts Working / Idle / Manual Stop machines per camera and as a total.
 """
 
 import cv2
@@ -31,213 +32,162 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── Camera Configuration ─────────────────────────────────────────────────────
-# CP PLUS NVR at 192.168.4.10
-# Channel numbers visible in NVR sidebar (1-indexed). Change ACTIVE_CHANNEL
-# to whichever channel shows the most CNC machines with indicator lights.
-# Channels seen in NVR: CAD CAM=1, OPC CENTER=2, CONFERENCE=3, PANNEL AREA=4,
-#   PASSAGE 1=5, CNC 2=6, CNC 2 PASSAGE=7, CNC 1 PASSAGE=8, CNC 1=9
-ACTIVE_CHANNEL = 9   # <-- change this to the channel number that shows all CNCs
+# ─── NVR Connection ───────────────────────────────────────────────────────────
+NVR_HOST     = "192.168.4.10"
+NVR_USER     = "admin"
+NVR_PASSWORD = "Admin@1234"
+NVR_PORT     = 554
 
-CAMERA_CONFIG = {
-    "base_url": "https://192.168.4.10",
-    "username": "admin",
-    "password": "Admin@1234",
-    "reconnect_delay": 5,
-    "frame_timeout": 10,
-    # CP PLUS NVR uses Dahua-compatible RTSP format:
-    # rtsp://user:pass@ip:554/cam/realmonitor?channel=N&subtype=0
-    "rtsp_urls": [
-        # Main stream — try each CNC channel
-        f"rtsp://admin:Admin@1234@192.168.4.10:554/cam/realmonitor?channel={ACTIVE_CHANNEL}&subtype=0",
-        f"rtsp://admin:Admin@1234@192.168.4.10:554/cam/realmonitor?channel={ACTIVE_CHANNEL}&subtype=1",
-        # Try channels 6–9 (CNC 2, CNC 2 PASSAGE, CNC 1 PASSAGE, CNC 1)
-        "rtsp://admin:Admin@1234@192.168.4.10:554/cam/realmonitor?channel=6&subtype=0",
-        "rtsp://admin:Admin@1234@192.168.4.10:554/cam/realmonitor?channel=7&subtype=0",
-        "rtsp://admin:Admin@1234@192.168.4.10:554/cam/realmonitor?channel=8&subtype=0",
-        "rtsp://admin:Admin@1234@192.168.4.10:554/cam/realmonitor?channel=9&subtype=0",
-        # Alternative CP PLUS NVR formats
-        f"rtsp://admin:Admin@1234@192.168.4.10:554/ch{ACTIVE_CHANNEL:02d}/main/av_stream",
-        f"rtsp://admin:Admin@1234@192.168.4.10:554/Streaming/Channels/{ACTIVE_CHANNEL}01",
-    ],
-    # CP PLUS HTTP snapshot fallback
-    "stream_paths": [
-        f"/cgi-bin/snapshot.cgi?channel={ACTIVE_CHANNEL}",
-        f"/cgi-bin/mjpg/video.cgi?channel={ACTIVE_CHANNEL}&subtype=0",
-        f"/onvif/snapshot?channel={ACTIVE_CHANNEL}",
-        "/cgi-bin/snapshot.cgi",
-        "/cgi-bin/mjpg/video.cgi",
-        "/video",
-        "/stream",
-    ],
+# ─── CNC Camera Channels ─────────────────────────────────────────────────────
+# Map of NVR channel number → display name.
+# Based on CP PLUS NVR sidebar order (adjust if your numbering differs).
+# Typical CP PLUS / Dahua format: channel=N in sidebar = N in RTSP URL.
+# Run /api/scan-channels to auto-discover which channels have CNC floors.
+CNC_CAMERAS = {
+    6:  "CNC 2",
+    7:  "CNC 2 PASSAGE",
+    8:  "CNC 1 PASSAGE",
+    9:  "CNC 1",
 }
 
-# ─── Machine ROI Configuration ────────────────────────────────────────────────
-# Fractional coordinates [x_start, y_start, width, height] relative to frame.
-# Indicator light sub-region within each ROI: top-center 30% of the ROI height.
-# Adjust these to match the actual camera view of your factory floor.
-DEFAULT_MACHINE_ROIS = {
-    1:  {"x": 0.02, "y": 0.05, "w": 0.17, "h": 0.42, "name": "CNC-001"},
-    2:  {"x": 0.21, "y": 0.05, "w": 0.17, "h": 0.42, "name": "CNC-002"},
-    3:  {"x": 0.40, "y": 0.05, "w": 0.17, "h": 0.42, "name": "CNC-003"},
-    4:  {"x": 0.59, "y": 0.05, "w": 0.17, "h": 0.42, "name": "CNC-004"},
-    5:  {"x": 0.78, "y": 0.05, "w": 0.17, "h": 0.42, "name": "CNC-005"},
-    6:  {"x": 0.02, "y": 0.54, "w": 0.17, "h": 0.42, "name": "CNC-006"},
-    7:  {"x": 0.21, "y": 0.54, "w": 0.17, "h": 0.42, "name": "CNC-007"},
-    8:  {"x": 0.40, "y": 0.54, "w": 0.17, "h": 0.42, "name": "CNC-008"},
-    9:  {"x": 0.59, "y": 0.54, "w": 0.17, "h": 0.42, "name": "CNC-009"},
-    10: {"x": 0.78, "y": 0.54, "w": 0.17, "h": 0.42, "name": "CNC-010"},
-}
+def rtsp_urls_for_channel(ch: int) -> list:
+    """Return ordered list of RTSP URLs to try for a CP PLUS NVR channel."""
+    u, p, h = NVR_USER, NVR_PASSWORD, NVR_HOST
+    return [
+        # CP PLUS / Dahua primary format
+        f"rtsp://{u}:{p}@{h}:{NVR_PORT}/cam/realmonitor?channel={ch}&subtype=0",
+        # Sub-stream (lower resolution, more stable)
+        f"rtsp://{u}:{p}@{h}:{NVR_PORT}/cam/realmonitor?channel={ch}&subtype=1",
+        # Alternative Dahua paths
+        f"rtsp://{u}:{p}@{h}:{NVR_PORT}/h264/ch{ch:02d}/main/av_stream",
+        f"rtsp://{u}:{p}@{h}:{NVR_PORT}/Streaming/Channels/{ch}01",
+        f"rtsp://{u}:{p}@{h}:{NVR_PORT}/ch{ch:02d}/0",
+    ]
 
-# ─── HSV Color Detection Thresholds ──────────────────────────────────────────
-# Tuned for typical industrial indicator lights.
-# Each entry: list of (lower, upper) HSV bound pairs + minimum pixel coverage %.
-COLOR_THRESHOLDS = {
-    "red": {
+# ─── Indicator Light Detection (Blob-based, No Fixed ROI) ────────────────────
+# Indicator lights are small bright saturated spots.
+# Area range is set relative to frame size so it works across resolutions.
+LIGHT_SPECS = {
+    "working": {  # Green light
         "ranges": [
-            (np.array([0,   120,  80]), np.array([10,  255, 255])),
-            (np.array([165, 120,  80]), np.array([180, 255, 255])),
+            (np.array([38,  70,  70]), np.array([88, 255, 255])),
         ],
-        "min_pct": 3.0,
+        "color_bgr": (0, 220, 60),
     },
-    "green": {
+    "idle": {  # Yellow light
         "ranges": [
-            (np.array([38,  60,  60]), np.array([88, 255, 255])),
+            (np.array([18,  80,  80]), np.array([38, 255, 255])),
         ],
-        "min_pct": 3.0,
+        "color_bgr": (0, 200, 240),
     },
-    "yellow": {
+    "manual_stop": {  # Red light (two hue ranges)
         "ranges": [
-            (np.array([18, 100, 100]), np.array([38, 255, 255])),
+            (np.array([0,  110,  80]), np.array([10, 255, 255])),
+            (np.array([165, 110,  80]), np.array([180, 255, 255])),
         ],
-        "min_pct": 3.0,
+        "color_bgr": (50, 50, 240),
     },
 }
 
-MACHINE_STATES = {
-    "working":     {"label": "Working",     "color": "#28a745"},
-    "idle":        {"label": "Idle",        "color": "#ffc107"},
-    "manual_stop": {"label": "Manual Stop", "color": "#dc3545"},
-    "off":         {"label": "OFF",         "color": "#6c757d"},
-    "unknown":     {"label": "Unknown",     "color": "#17a2b8"},
-}
-
-SHIFT_HOURS = 8
+_MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
 
-# ─── Machine State Tracker ────────────────────────────────────────────────────
-class MachineStateTracker:
-    def __init__(self, machine_id: int, name: str):
-        self.machine_id = machine_id
-        self.name = name
-        self._lock = threading.Lock()
-        self.current_state = "unknown"
-        self.previous_state = None
-        self.state_since = datetime.now()
-        self.session_start = datetime.now()
-        self.state_history: deque = deque(maxlen=20000)
-        self.state_history.append((datetime.now(), "unknown"))
-        self.manual_stop_count = 0
-        self.alerts: deque = deque(maxlen=100)
+def detect_indicator_lights(frame: np.ndarray) -> dict:
+    """
+    Scan the full frame for indicator light blobs.
+    Returns {"working": N, "idle": N, "manual_stop": N, "blobs": [...]}
+    blobs is a list of (x, y, radius, state) for drawing circles on stream.
+    """
+    if frame is None or frame.size == 0:
+        return {"working": 0, "idle": 0, "manual_stop": 0, "blobs": []}
 
-    def update_state(self, new_state: str):
-        with self._lock:
-            if new_state == self.current_state:
-                return None
-            now = datetime.now()
-            self.previous_state = self.current_state
-            self.current_state = new_state
-            self.state_since = now
-            self.state_history.append((now, new_state))
-            alert = None
-            if new_state == "manual_stop":
-                self.manual_stop_count += 1
-                alert = {
-                    "timestamp": now.isoformat(),
-                    "machine_id": self.machine_id,
-                    "machine_name": self.name,
-                    "type": "manual_stop",
-                    "message": f"{self.name} entered Manual Stop",
-                    "severity": "high",
-                }
-                self.alerts.appendleft(alert)
-            elif new_state == "off" and self.previous_state == "working":
-                alert = {
-                    "timestamp": now.isoformat(),
-                    "machine_id": self.machine_id,
-                    "machine_name": self.name,
-                    "type": "machine_off",
-                    "message": f"{self.name} turned OFF unexpectedly",
-                    "severity": "medium",
-                }
-                self.alerts.appendleft(alert)
-            return alert
+    h, w = frame.shape[:2]
+    total_px   = h * w
+    min_area   = max(15,  int(total_px * 0.00005))   # ~0.005% of frame
+    max_area   = int(total_px * 0.004)               # ~0.4%  of frame
 
-    def get_metrics(self) -> dict:
-        with self._lock:
-            now = datetime.now()
-            shift_start = now - timedelta(hours=SHIFT_HOURS)
-            history = [(ts, st) for ts, st in self.state_history if ts >= shift_start]
+    # Work on a slightly blurred frame to reduce noise
+    blurred = cv2.GaussianBlur(frame, (3, 3), 0)
+    hsv     = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
-            durations = {"working": 0.0, "idle": 0.0, "manual_stop": 0.0, "off": 0.0, "unknown": 0.0}
-            for i, (ts, st) in enumerate(history):
-                next_ts = history[i + 1][0] if i + 1 < len(history) else now
-                secs = (next_ts - ts).total_seconds()
-                durations[st] = durations.get(st, 0.0) + secs
+    results = {"working": 0, "idle": 0, "manual_stop": 0, "blobs": []}
 
-            total = max(sum(durations.values()), 1.0)
-            current_secs = (now - self.state_since).total_seconds()
+    for state, spec in LIGHT_SPECS.items():
+        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        for lo, hi in spec["ranges"]:
+            mask = cv2.bitwise_or(mask, cv2.inRange(hsv, lo, hi))
 
-            def fmt(seconds: float) -> str:
-                m, s = divmod(int(seconds), 60)
-                h, m = divmod(m, 60)
-                return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+        # Morphological clean-up
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  _MORPH_KERNEL)
+        mask = cv2.dilate(mask, _MORPH_KERNEL, iterations=2)
 
-            return {
-                "machine_id": self.machine_id,
-                "name": self.name,
-                "current_state": self.current_state,
-                "state_label": MACHINE_STATES.get(self.current_state, {}).get("label", "Unknown"),
-                "state_color": MACHINE_STATES.get(self.current_state, {}).get("color", "#6c757d"),
-                "state_since": self.state_since.isoformat(),
-                "current_duration_seconds": int(current_secs),
-                "current_duration_fmt": fmt(current_secs),
-                "uptime_pct": round(durations["working"] / total * 100, 1),
-                "idle_pct": round(durations["idle"] / total * 100, 1),
-                "manual_stop_pct": round(durations["manual_stop"] / total * 100, 1),
-                "working_seconds": int(durations["working"]),
-                "idle_seconds": int(durations["idle"]),
-                "manual_stop_seconds": int(durations["manual_stop"]),
-                "working_fmt": fmt(durations["working"]),
-                "idle_fmt": fmt(durations["idle"]),
-                "manual_stop_fmt": fmt(durations["manual_stop"]),
-                "manual_stop_count": self.manual_stop_count,
-                "last_updated": now.isoformat(),
-            }
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    def get_alerts(self) -> list:
-        with self._lock:
-            return list(self.alerts)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if min_area <= area <= max_area:
+                perimeter = cv2.arcLength(cnt, True)
+                if perimeter == 0:
+                    continue
+                circularity = 4 * np.pi * area / (perimeter ** 2)
+                if circularity < 0.08:   # reject very elongated shapes
+                    continue
+                # Get enclosing circle for drawing
+                (cx, cy), radius = cv2.minEnclosingCircle(cnt)
+                results[state] += 1
+                results["blobs"].append((int(cx), int(cy), max(6, int(radius * 2.5)), state))
+
+    return results
 
 
-# ─── Camera Manager ───────────────────────────────────────────────────────────
+def annotate_frame(frame: np.ndarray, detections: dict, cam_name: str) -> np.ndarray:
+    """Draw detection circles and a status overlay on the frame (no ROI boxes)."""
+    if frame is None:
+        return frame
+    out = frame.copy()
+    h, w = out.shape[:2]
+
+    for (cx, cy, r, state) in detections.get("blobs", []):
+        color_bgr = LIGHT_SPECS[state]["color_bgr"]
+        cv2.circle(out, (cx, cy), r,     color_bgr, 2)
+        cv2.circle(out, (cx, cy), r + 3, color_bgr, 1)
+
+    # Overlay: camera name + counts bar
+    overlay = out.copy()
+    cv2.rectangle(overlay, (0, h - 36), (w, h), (10, 10, 20), -1)
+    cv2.addWeighted(overlay, 0.7, out, 0.3, 0, out)
+
+    summary = (
+        f"{cam_name}  |  "
+        f"Working: {detections['working']}  "
+        f"Idle: {detections['idle']}  "
+        f"Stop: {detections['manual_stop']}"
+    )
+    cv2.putText(out, summary, (10, h - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 200, 200), 1, cv2.LINE_AA)
+    return out
+
+
+# ─── Single-Channel Camera Manager ───────────────────────────────────────────
 class CameraManager:
-    def __init__(self, config: dict):
-        self.config = config
-        self._frame = None
-        self._lock = threading.Lock()
-        self.running = False
-        self.connected = False
+    def __init__(self, channel: int, name: str):
+        self.channel  = channel
+        self.name     = name
+        self._frame   = None
+        self._lock    = threading.Lock()
+        self.connected       = False
         self.connection_error: str = None
-        self.frame_count = 0
+        self.frame_count     = 0
         self.active_url: str = None
         self._cap: cv2.VideoCapture = None
-        self._http_mode = False
+        self.running         = False
         self._thread: threading.Thread = None
+        self._detections     = {"working": 0, "idle": 0, "manual_stop": 0, "blobs": []}
+        self._det_lock       = threading.Lock()
+        self._history        = deque(maxlen=5000)  # (timestamp, detections)
 
-    # --- Connection helpers ---
-    def _try_rtsp(self) -> bool:
-        for url in self.config["rtsp_urls"]:
+    def _try_connect(self) -> bool:
+        for url in rtsp_urls_for_channel(self.channel):
             try:
                 cap = cv2.VideoCapture(url)
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
@@ -246,109 +196,67 @@ class CameraManager:
                 if cap.isOpened():
                     ret, frame = cap.read()
                     if ret and frame is not None:
-                        logger.info(f"Camera connected via RTSP: {url}")
-                        self._cap = cap
+                        logger.info(f"[ch{self.channel}] {self.name}: connected via {url}")
+                        self._cap      = cap
                         self.active_url = url
-                        self._http_mode = False
                         return True
                 cap.release()
             except Exception as e:
-                logger.debug(f"RTSP {url} failed: {e}")
+                logger.debug(f"[ch{self.channel}] {url} failed: {e}")
         return False
 
-    def _try_http(self) -> bool:
-        base = self.config["base_url"]
-        auth = (self.config["username"], self.config["password"])
-        for path in self.config["stream_paths"]:
-            url = f"{base}{path}"
-            try:
-                resp = requests.get(url, auth=auth, stream=True, verify=False, timeout=5)
-                if resp.status_code == 200:
-                    logger.info(f"Camera connected via HTTP: {url}")
-                    self.active_url = url
-                    self._http_mode = True
-                    resp.close()
-                    return True
-                resp.close()
-            except Exception as e:
-                logger.debug(f"HTTP {url} failed: {e}")
-        return False
-
-    def _fetch_http_frame(self):
-        auth = (self.config["username"], self.config["password"])
-        try:
-            resp = requests.get(
-                self.active_url, auth=auth, stream=True, verify=False,
-                timeout=self.config["frame_timeout"]
-            )
-            buf = b""
-            for chunk in resp.iter_content(chunk_size=8192):
-                buf += chunk
-                a = buf.find(b"\xff\xd8")
-                b = buf.find(b"\xff\xd9")
-                if a != -1 and b != -1:
-                    jpg = buf[a : b + 2]
-                    buf = buf[b + 2 :]
-                    img = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
-                    resp.close()
-                    return img
-                if len(buf) > 1_000_000:
-                    buf = buf[-200_000:]
-            resp.close()
-        except Exception as e:
-            logger.debug(f"HTTP frame error: {e}")
-        return None
-
-    # --- Capture loop ---
     def _loop(self):
+        reconnect_delay = 5
         while self.running:
             if not self.connected:
-                if self._try_rtsp() or self._try_http():
-                    self.connected = True
+                if self._try_connect():
+                    self.connected       = True
                     self.connection_error = None
+                    reconnect_delay      = 5
                 else:
-                    self.connection_error = "Cannot connect to camera"
-                    logger.warning(
-                        f"Camera offline — retrying in {self.config['reconnect_delay']}s"
-                    )
-                    time.sleep(self.config["reconnect_delay"])
+                    self.connection_error = f"ch{self.channel} offline"
+                    logger.warning(f"[ch{self.channel}] {self.name}: offline, retry in {reconnect_delay}s")
+                    time.sleep(reconnect_delay)
+                    reconnect_delay = min(reconnect_delay * 2, 60)
                     continue
 
             try:
-                if not self._http_mode and self._cap and self._cap.isOpened():
+                if self._cap and self._cap.isOpened():
                     ret, frame = self._cap.read()
                     if ret and frame is not None:
                         with self._lock:
-                            self._frame = frame
+                            self._frame      = frame
                             self.frame_count += 1
+                        # Detect lights on this frame
+                        det = detect_indicator_lights(frame)
+                        with self._det_lock:
+                            self._detections = det
+                            self._history.append((datetime.now(), {
+                                "working":     det["working"],
+                                "idle":        det["idle"],
+                                "manual_stop": det["manual_stop"],
+                            }))
                     else:
-                        logger.warning("RTSP read failed — reconnecting")
+                        logger.warning(f"[ch{self.channel}] read failed — reconnecting")
                         self._cap.release()
-                        self._cap = None
+                        self._cap     = None
                         self.connected = False
                 else:
-                    frame = self._fetch_http_frame()
-                    if frame is not None:
-                        with self._lock:
-                            self._frame = frame
-                            self.frame_count += 1
-                    else:
-                        logger.warning("HTTP frame fetch failed — reconnecting")
-                        self.connected = False
-                        time.sleep(1)
+                    self.connected = False
             except Exception as e:
-                logger.error(f"Capture loop error: {e}")
+                logger.error(f"[ch{self.channel}] capture error: {e}")
                 self.connected = False
                 if self._cap:
                     self._cap.release()
                     self._cap = None
-                time.sleep(self.config["reconnect_delay"])
+                time.sleep(5)
 
     def start(self):
         self.running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True, name="camera-capture")
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name=f"cam-ch{self.channel}"
+        )
         self._thread.start()
-        logger.info("Camera manager started")
 
     def stop(self):
         self.running = False
@@ -359,259 +267,261 @@ class CameraManager:
         with self._lock:
             return self._frame.copy() if self._frame is not None else None
 
-    def status(self) -> dict:
-        return {
-            "connected": self.connected,
-            "error": self.connection_error,
-            "frame_count": self.frame_count,
-            "active_url": self.active_url,
-        }
+    def get_detections(self) -> dict:
+        with self._det_lock:
+            return dict(self._detections)
 
-
-# ─── Color Detection ──────────────────────────────────────────────────────────
-def detect_light_color(roi: np.ndarray) -> str:
-    """Return 'red', 'green', 'yellow', or 'off' for the indicator light in roi."""
-    if roi is None or roi.size == 0:
-        return "unknown"
-
-    # Focus on the top-center stripe of the ROI where the indicator light sits
-    h, w = roi.shape[:2]
-    strip_h = max(1, int(h * 0.35))
-    strip_x = max(0, int(w * 0.20))
-    strip_w = max(1, int(w * 0.60))
-    light_region = roi[0:strip_h, strip_x : strip_x + strip_w]
-
-    hsv = cv2.cvtColor(light_region, cv2.COLOR_BGR2HSV)
-    total_px = light_region.shape[0] * light_region.shape[1]
-    if total_px == 0:
-        return "unknown"
-
-    # Check overall brightness — low brightness means no light
-    brightness_mask = cv2.inRange(hsv, np.array([0, 40, 80]), np.array([180, 255, 255]))
-    lit_pct = cv2.countNonZero(brightness_mask) / total_px * 100
-    if lit_pct < 2.5:
-        return "off"
-
-    best_color = "off"
-    best_pct = 0.0
-    for color_name, cfg in COLOR_THRESHOLDS.items():
-        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        for lo, hi in cfg["ranges"]:
-            mask = cv2.bitwise_or(mask, cv2.inRange(hsv, lo, hi))
-        pct = cv2.countNonZero(mask) / total_px * 100
-        if pct >= cfg["min_pct"] and pct > best_pct:
-            best_pct = pct
-            best_color = color_name
-
-    return best_color
-
-
-def color_to_state(color: str) -> str:
-    return {"red": "manual_stop", "green": "working", "yellow": "idle", "off": "off"}.get(
-        color, "unknown"
-    )
-
-
-def _hex_to_bgr(hex_color: str):
-    h = hex_color.lstrip("#")
-    r, g, b = (int(h[i : i + 2], 16) for i in (0, 2, 4))
-    return (b, g, r)
-
-
-# ─── Frame Processor ──────────────────────────────────────────────────────────
-class FrameProcessor:
-    def __init__(self, machine_rois: dict, trackers: dict):
-        self.machine_rois = machine_rois
-        self.trackers = trackers
-        self._alerts: deque = deque(maxlen=200)
-        self._lock = threading.Lock()
-
-    def process(self, frame: np.ndarray) -> np.ndarray:
+    def get_annotated_frame(self):
+        frame = self.get_frame()
         if frame is None:
             return None
-        h, w = frame.shape[:2]
-        annotated = frame.copy()
+        det = self.get_detections()
+        return annotate_frame(frame, det, self.name)
 
-        for mid, roi_cfg in self.machine_rois.items():
-            x = max(0, int(roi_cfg["x"] * w))
-            y = max(0, int(roi_cfg["y"] * h))
-            bw = max(1, min(int(roi_cfg["w"] * w), w - x))
-            bh = max(1, min(int(roi_cfg["h"] * h), h - y))
+    def get_status(self) -> dict:
+        det = self.get_detections()
+        return {
+            "channel":       self.channel,
+            "name":          self.name,
+            "connected":     self.connected,
+            "error":         self.connection_error,
+            "active_url":    self.active_url,
+            "frame_count":   self.frame_count,
+            "working":       det["working"],
+            "idle":          det["idle"],
+            "manual_stop":   det["manual_stop"],
+            "last_updated":  datetime.now().isoformat(),
+        }
 
-            roi = frame[y : y + bh, x : x + bw]
-            color = detect_light_color(roi)
-            state = color_to_state(color)
-
-            alert = self.trackers[mid].update_state(state)
-            if alert:
-                with self._lock:
-                    self._alerts.appendleft(alert)
-
-            s_info = MACHINE_STATES.get(state, MACHINE_STATES["unknown"])
-            bgr = _hex_to_bgr(s_info["color"])
-            cv2.rectangle(annotated, (x, y), (x + bw, y + bh), bgr, 2)
-            label = f"{roi_cfg['name']}: {s_info['label']}"
-            cv2.putText(
-                annotated, label, (x + 2, y - 5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, bgr, 1, cv2.LINE_AA,
-            )
-
-        return annotated
-
-    def get_global_alerts(self) -> list:
-        with self._lock:
-            return list(self._alerts)
+    def get_shift_totals(self) -> dict:
+        """Average counts over the last 8-hour shift window."""
+        with self._det_lock:
+            cutoff = datetime.now() - timedelta(hours=8)
+            recent = [(ts, d) for ts, d in self._history if ts >= cutoff]
+        if not recent:
+            return {"working": 0, "idle": 0, "manual_stop": 0}
+        avg = lambda key: round(sum(d[key] for _, d in recent) / len(recent), 1)
+        return {"working": avg("working"), "idle": avg("idle"), "manual_stop": avg("manual_stop")}
 
 
-# ─── Global Singletons ────────────────────────────────────────────────────────
-machine_rois = DEFAULT_MACHINE_ROIS
-trackers = {i: MachineStateTracker(i, cfg["name"]) for i, cfg in machine_rois.items()}
-camera = CameraManager(CAMERA_CONFIG)
-processor = FrameProcessor(machine_rois, trackers)
+# ─── Global Camera Pool ────────────────────────────────────────────────────────
+cameras: dict[int, CameraManager] = {
+    ch: CameraManager(ch, name) for ch, name in CNC_CAMERAS.items()
+}
 
 # ─── Flask App ────────────────────────────────────────────────────────────────
-app = Flask(__name__, static_folder=".", static_url_path="")
+app     = Flask(__name__, static_folder=".", static_url_path="")
 CORS(app)
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+_OFFLINE_JPEG: bytes = None
 
+def _make_offline_jpeg(msg: str = "Camera Offline") -> bytes:
+    img = np.zeros((360, 640, 3), dtype=np.uint8)
+    img[:] = (15, 15, 25)
+    cv2.putText(img, msg, (max(0, 320 - len(msg) * 8), 180),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.85, (60, 60, 200), 2, cv2.LINE_AA)
+    cv2.putText(img, "Waiting for camera connection...", (130, 220),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1, cv2.LINE_AA)
+    _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 55])
+    return buf.tobytes()
+
+
+# ─── Routes ───────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
     return send_from_directory(BASE_DIR, "dashboard.html")
 
-
 @app.route("/style.css")
 def serve_css():
     return send_from_directory(BASE_DIR, "style.css")
-
 
 @app.route("/app.js")
 def serve_js():
     return send_from_directory(BASE_DIR, "app.js")
 
 
-@app.route("/api/status")
-def api_status():
-    machines = {mid: t.get_metrics() for mid, t in trackers.items()}
-    states = [m["current_state"] for m in machines.values()]
-    summary = {
-        "working": states.count("working"),
-        "idle": states.count("idle"),
-        "manual_stop": states.count("manual_stop"),
-        "off": states.count("off"),
-        "unknown": states.count("unknown"),
+@app.route("/api/cameras")
+def api_cameras():
+    """Return status + light counts for all CNC cameras."""
+    cam_data = {str(ch): cam.get_status() for ch, cam in cameras.items()}
+
+    # Aggregate totals across all cameras
+    # Note: machines visible in multiple cameras may be counted more than once.
+    totals = {
+        "working":     sum(c["working"]     for c in cam_data.values()),
+        "idle":        sum(c["idle"]        for c in cam_data.values()),
+        "manual_stop": sum(c["manual_stop"] for c in cam_data.values()),
     }
+    connected_cams = sum(1 for c in cam_data.values() if c["connected"])
+
     return jsonify({
-        "machines": machines,
-        "summary": summary,
-        "camera": camera.status(),
-        "timestamp": datetime.now().isoformat(),
-        "total_machines": len(machines),
+        "cameras":          cam_data,
+        "totals":           totals,
+        "connected_cameras": connected_cams,
+        "total_cameras":    len(cameras),
+        "timestamp":        datetime.now().isoformat(),
     })
 
 
-@app.route("/api/machines/<int:machine_id>")
-def api_machine(machine_id):
-    if machine_id not in trackers:
-        return jsonify({"error": "Machine not found"}), 404
-    return jsonify(trackers[machine_id].get_metrics())
+@app.route("/api/cameras/<int:channel>")
+def api_camera_status(channel):
+    if channel not in cameras:
+        return jsonify({"error": "Channel not found"}), 404
+    return jsonify(cameras[channel].get_status())
 
 
-@app.route("/api/alerts")
-def api_alerts():
-    all_alerts = processor.get_global_alerts()
-    for t in trackers.values():
-        all_alerts.extend(t.get_alerts())
-    all_alerts.sort(key=lambda a: a["timestamp"], reverse=True)
-    unique = {a["timestamp"] + a["machine_name"]: a for a in all_alerts}
-    return jsonify({"alerts": list(unique.values())[:50]})
+@app.route("/api/stream/<int:channel>")
+def api_stream_channel(channel):
+    """MJPEG stream for a specific camera channel (no ROI boxes, light circles only)."""
+    global _OFFLINE_JPEG
+    if _OFFLINE_JPEG is None:
+        _OFFLINE_JPEG = _make_offline_jpeg()
 
+    cam = cameras.get(channel)
 
-@app.route("/api/config/roi", methods=["GET"])
-def api_get_roi():
-    return jsonify({"rois": machine_rois})
+    def generate():
+        while True:
+            try:
+                if cam is not None:
+                    frame = cam.get_annotated_frame()
+                else:
+                    frame = None
 
+                if frame is not None:
+                    ret, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 72])
+                    jpeg = buf.tobytes() if ret else _OFFLINE_JPEG
+                else:
+                    jpeg = _OFFLINE_JPEG
 
-@app.route("/api/config/roi/<int:machine_id>", methods=["PUT"])
-def api_update_roi(machine_id):
-    if machine_id not in machine_rois:
-        return jsonify({"error": "Machine not found"}), 404
-    data = request.get_json(force=True) or {}
-    for k in ("x", "y", "w", "h"):
-        if k in data:
-            machine_rois[machine_id][k] = float(data[k])
-    if "name" in data:
-        machine_rois[machine_id]["name"] = str(data["name"])
-        trackers[machine_id].name = str(data["name"])
-    processor.machine_rois = machine_rois
-    return jsonify({"success": True, "roi": machine_rois[machine_id]})
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n")
+            except GeneratorExit:
+                break
+            except Exception as e:
+                logger.debug(f"Stream ch{channel} error: {e}")
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + _OFFLINE_JPEG + b"\r\n")
+            time.sleep(0.1)
+
+    return Response(
+        generate(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
+    )
 
 
 @app.route("/api/stream")
-def api_stream():
-    def generate():
-        while True:
-            frame = camera.get_frame()
-            if frame is not None:
-                out = processor.process(frame) or frame
-            else:
-                out = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(out, "Camera Offline", (150, 240),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 220), 2, cv2.LINE_AA)
-            ret, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 72])
-            if ret:
-                yield (
-                    b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
-                    + buf.tobytes()
-                    + b"\r\n"
-                )
-            time.sleep(0.08)
-
-    return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
+def api_stream_default():
+    """Default stream: first connected camera."""
+    for ch in sorted(cameras.keys()):
+        if cameras[ch].connected:
+            return api_stream_channel(ch)
+    # None connected — return offline frame for first channel
+    first_ch = next(iter(cameras))
+    return api_stream_channel(first_ch)
 
 
-@app.route("/api/frame")
-def api_frame():
-    frame = camera.get_frame()
+@app.route("/api/snapshot/<int:channel>")
+def api_snapshot(channel):
+    """Single JPEG snapshot for embedding in dashboard camera tiles."""
+    global _OFFLINE_JPEG
+    if _OFFLINE_JPEG is None:
+        _OFFLINE_JPEG = _make_offline_jpeg()
+
+    cam = cameras.get(channel)
+    if cam is None:
+        return Response(_OFFLINE_JPEG, mimetype="image/jpeg")
+
+    frame = cam.get_annotated_frame()
     if frame is None:
-        return jsonify({"error": "No frame available"}), 503
-    out = processor.process(frame) or frame
-    ret, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        return Response(_OFFLINE_JPEG, mimetype="image/jpeg")
+
+    ret, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
     if not ret:
-        return jsonify({"error": "Encoding failed"}), 500
-    return Response(buf.tobytes(), mimetype="image/jpeg")
+        return Response(_OFFLINE_JPEG, mimetype="image/jpeg")
+
+    return Response(buf.tobytes(), mimetype="image/jpeg",
+                    headers={"Cache-Control": "no-cache"})
+
+
+@app.route("/api/scan-channels")
+def api_scan_channels():
+    """
+    Probe NVR channels 1-16 and report which are reachable.
+    Use this to discover the correct channel numbers for your CNC cameras.
+    WARNING: This makes 16 RTSP connections and takes ~60s to complete.
+    """
+    results = []
+    for ch in range(1, 17):
+        url = (f"rtsp://{NVR_USER}:{NVR_PASSWORD}@{NVR_HOST}:{NVR_PORT}"
+               f"/cam/realmonitor?channel={ch}&subtype=1")
+        try:
+            cap = cv2.VideoCapture(url)
+            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 4000)
+            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 4000)
+            opened = cap.isOpened()
+            frame_ok = False
+            if opened:
+                ret, _ = cap.read()
+                frame_ok = ret
+            cap.release()
+            results.append({"channel": ch, "reachable": opened, "frame": frame_ok})
+            logger.info(f"Scan ch{ch}: reachable={opened} frame={frame_ok}")
+        except Exception as e:
+            results.append({"channel": ch, "reachable": False, "error": str(e)})
+    return jsonify({"results": results})
 
 
 @app.route("/api/health")
 def api_health():
+    connected = sum(1 for c in cameras.values() if c.connected)
     return jsonify({
-        "status": "ok",
-        "camera_connected": camera.connected,
-        "frame_count": camera.frame_count,
-        "timestamp": datetime.now().isoformat(),
+        "status":            "ok",
+        "connected_cameras": connected,
+        "total_cameras":     len(cameras),
+        "timestamp":         datetime.now().isoformat(),
     })
 
 
-# ─── Background Processing Loop ──────────────────────────────────────────────
-def _processing_loop():
-    logger.info("Frame processing loop started")
-    while True:
-        frame = camera.get_frame()
-        if frame is not None:
-            processor.process(frame)
-        time.sleep(0.4)
+# ─── Config: add/remove channels at runtime ───────────────────────────────────
+@app.route("/api/config/cameras", methods=["GET"])
+def api_get_camera_config():
+    return jsonify({"channels": {str(k): v for k, v in CNC_CAMERAS.items()}})
+
+
+@app.route("/api/config/cameras", methods=["PUT"])
+def api_set_camera_channels():
+    """
+    Update which channels are monitored.
+    Body: {"channels": {"6": "CNC 2", "7": "CNC 2 PASSAGE", ...}}
+    """
+    data = request.get_json(force=True) or {}
+    new_channels = data.get("channels", {})
+    global cameras
+    # Stop old cameras not in new list
+    for ch, cam in list(cameras.items()):
+        if str(ch) not in new_channels:
+            cam.stop()
+            del cameras[ch]
+    # Start new cameras
+    for ch_str, name in new_channels.items():
+        ch = int(ch_str)
+        if ch not in cameras:
+            cameras[ch] = CameraManager(ch, name)
+            cameras[ch].start()
+        else:
+            cameras[ch].name = name
+    return jsonify({"success": True, "active_channels": list(cameras.keys())})
 
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     logger.info("=" * 60)
-    logger.info("CNC Machine Monitor — Starting up")
+    logger.info("CNC Machine Monitor — Multi-Camera Edition")
+    logger.info(f"Monitoring {len(cameras)} cameras: {list(CNC_CAMERAS.values())}")
     logger.info("=" * 60)
-    camera.start()
 
-    proc_thread = threading.Thread(target=_processing_loop, daemon=True, name="frame-processor")
-    proc_thread.start()
+    for cam in cameras.values():
+        cam.start()
 
     time.sleep(2)
     logger.info("Dashboard available at http://0.0.0.0:5000")
