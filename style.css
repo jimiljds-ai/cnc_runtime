@@ -236,6 +236,196 @@ html, body {
   overflow: hidden;
 }
 
+/* ══════════════════════════════════════════════════════════════
+   CAMERA AREA + TILES (replaces machine-grid-area)
+══════════════════════════════════════════════════════════════ */
+.camera-area {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-right: 1px solid var(--border);
+}
+
+.camera-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  grid-template-rows: repeat(2, 1fr);
+  gap: 10px;
+  padding: 12px 16px;
+  flex: 1;
+  overflow: hidden;
+}
+
+/* ── Camera Tile ─────────────────────────────────────────── */
+.camera-tile {
+  background: var(--bg-card);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transition: border-color 0.3s;
+}
+
+.camera-tile.cam-tile-online  { border-color: rgba(34,197,94,0.3); }
+.camera-tile.cam-tile-offline { border-color: rgba(239,68,68,0.2); opacity: 0.8; }
+
+.tile-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  background: var(--bg-nav);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.tile-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.dot-online  { background: var(--c-working); box-shadow: 0 0 6px var(--c-working); }
+.dot-offline { background: var(--c-stop);    animation: blink-dot 1.4s infinite; }
+
+.tile-name {
+  font-size: 12px;
+  font-weight: 700;
+  color: #e2e8f0;
+  flex: 1;
+  letter-spacing: 0.5px;
+}
+
+.tile-ch {
+  font-size: 10px;
+  color: var(--c-muted);
+  font-family: var(--font-mono);
+}
+
+.tile-feed-wrap {
+  position: relative;
+  flex: 1;
+  overflow: hidden;
+  background: #000;
+  min-height: 0;
+}
+
+.tile-feed {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+/* Count pills overlaid on the feed */
+.tile-counts-overlay {
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  display: flex;
+  gap: 5px;
+  pointer-events: none;
+}
+
+.count-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  backdrop-filter: blur(6px);
+  border: 1px solid rgba(255,255,255,0.1);
+}
+
+.pill-working { background: rgba(34,197,94,0.8);  color: #fff; }
+.pill-idle    { background: rgba(245,158,11,0.8); color: #fff; }
+.pill-stop    { background: rgba(239,68,68,0.8);  color: #fff; }
+
+/* Note text in section header */
+.note-text {
+  font-size: 11px;
+  color: var(--c-muted);
+  font-weight: 400;
+}
+
+/* ── Per-Camera Sidebar Counts ───────────────────────────── */
+.per-cam-row {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  margin-bottom: 6px;
+  background: rgba(255,255,255,0.03);
+  border: 1px solid var(--border);
+}
+.per-cam-row.per-cam-offline { opacity: 0.55; }
+
+.per-cam-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: #cbd5e1;
+  display: flex;
+  align-items: center;
+}
+
+.per-cam-pills {
+  display: flex;
+  gap: 5px;
+}
+
+.mini-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  flex: 1;
+  justify-content: center;
+}
+.mini-pill.pill-working { background: rgba(34,197,94,0.15);  color: var(--c-working); border: 1px solid rgba(34,197,94,0.3); }
+.mini-pill.pill-idle    { background: rgba(245,158,11,0.15); color: var(--c-idle);    border: 1px solid rgba(245,158,11,0.3); }
+.mini-pill.pill-stop    { background: rgba(239,68,68,0.15);  color: var(--c-stop);    border: 1px solid rgba(239,68,68,0.3); }
+.pill-label { font-size: 9px; font-weight: 400; opacity: 0.8; }
+
+/* ── Legend ──────────────────────────────────────────────── */
+.legend-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: #cbd5e1;
+}
+.legend-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.legend-note {
+  font-size: 10px;
+  color: var(--c-muted);
+  padding: 6px 8px;
+  background: rgba(245,158,11,0.05);
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(245,158,11,0.15);
+}
+
+/* ── KPI extra cards ─────────────────────────────────────── */
+.kpi-efficiency .kpi-icon { background: rgba(56,189,248,0.15);  color: #38bdf8; }
+.kpi-efficiency .kpi-count { color: #38bdf8; }
+.kpi-cameras    .kpi-icon { background: rgba(168,85,247,0.15);  color: #a855f7; }
+.kpi-cameras    .kpi-count { color: #a855f7; }
+
+/* ── KEEP OLD machine-grid-area so nothing breaks ─────────── */
 .machine-grid-area {
   display: flex;
   flex-direction: column;

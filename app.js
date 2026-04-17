@@ -1,39 +1,37 @@
 "use strict";
 
 /* ═══════════════════════════════════════════════════════════════
-   CNC Machine Monitor — Frontend Live Logic
-   Polls /api/status every 2 s and refreshes all dashboard elements
+   CNC Machine Monitor — Multi-Camera Frontend
+   Polls /api/cameras every 2 s and renders 4 live camera tiles
+   with per-camera working/idle/stop counts.
 ═══════════════════════════════════════════════════════════════ */
 
-const API_BASE = "";
-const REFRESH_MS = 2000;
-const TOTAL_MACHINES = 10;
-const SHIFT_HOURS = 8;
+const API_BASE    = "";
+const REFRESH_MS  = 2000;
 
-// State colours mapped to CSS class suffixes and hex
-const STATE_META = {
-  working:     { label: "Working",     icon: "fa-cog fa-spin",          hex: "#22c55e" },
-  idle:        { label: "Idle",        icon: "fa-hourglass-half",        hex: "#f59e0b" },
-  manual_stop: { label: "Manual Stop", icon: "fa-exclamation-triangle",  hex: "#ef4444" },
-  off:         { label: "OFF",         icon: "fa-power-off",             hex: "#64748b" },
-  unknown:     { label: "Unknown",     icon: "fa-question-circle",       hex: "#38bdf8" },
+// Known CNC camera channels (must match backend CNC_CAMERAS)
+const CNC_CHANNELS = [6, 7, 8, 9];
+
+const STATE_COLORS = {
+  working:     "#22c55e",
+  idle:        "#f59e0b",
+  manual_stop: "#ef4444",
 };
 
-// Track last-known state per machine to detect transitions
-const prevState = {};
-let seenAlerts   = new Set();
-let alertCount   = 0;
-let refreshTimer = null;
+let prevTotals  = {};
+let alertCount  = 0;
+let seenAlerts  = new Set();
+let tilesBuilt  = false;
 
-// ─── Startup ─────────────────────────────────────────────────────────────────
+// ─── Init ─────────────────────────────────────────────────────────────────────
 document.addEventListener("DOMContentLoaded", () => {
   startClock();
-  buildMachineCards();
-  tick();                          // immediate first fetch
-  refreshTimer = setInterval(tick, REFRESH_MS);
+  buildCameraTiles();
+  tick();
+  setInterval(tick, REFRESH_MS);
 });
 
-// ─── Clock & Date ─────────────────────────────────────────────────────────────
+// ─── Clock ────────────────────────────────────────────────────────────────────
 function startClock() {
   const clockEl = document.getElementById("live-clock");
   const dateEl  = document.getElementById("live-date");
@@ -43,349 +41,276 @@ function startClock() {
     dateEl.textContent  = now.toLocaleDateString("en-GB", {
       weekday: "short", day: "2-digit", month: "short", year: "numeric",
     });
-    updateShiftProgress(now);
   }
   update();
   setInterval(update, 1000);
 }
 
-function updateShiftProgress(now) {
-  // Assume shift starts at 08:00
-  const shiftStartHour = 8;
-  const minutesSinceStart =
-    (now.getHours() - shiftStartHour) * 60 + now.getMinutes();
-  const pct = Math.min(100, Math.max(0, (minutesSinceStart / (SHIFT_HOURS * 60)) * 100));
-  const bar   = document.getElementById("shift-progress-bar");
-  const label = document.getElementById("shift-pct-label");
-  if (bar)   bar.style.width = pct.toFixed(1) + "%";
-  if (label) label.textContent = pct.toFixed(0) + "%";
-}
-
-// ─── Build Initial Skeleton Cards ────────────────────────────────────────────
-function buildMachineCards() {
-  const grid = document.getElementById("machine-grid");
+// ─── Build Camera Tile Grid ───────────────────────────────────────────────────
+function buildCameraTiles() {
+  const grid = document.getElementById("camera-grid");
   if (!grid) return;
   grid.innerHTML = "";
-  for (let i = 1; i <= TOTAL_MACHINES; i++) {
-    grid.insertAdjacentHTML("beforeend", machineCardHTML(i, null));
-  }
+  CNC_CHANNELS.forEach(ch => {
+    grid.insertAdjacentHTML("beforeend", cameraTileHTML(ch, null));
+  });
+  tilesBuilt = true;
 }
 
-function machineCardHTML(id, data) {
-  const name     = data ? data.name          : `CNC-${String(id).padStart(3, "0")}`;
-  const state    = data ? data.current_state : "unknown";
-  const meta     = STATE_META[state] || STATE_META.unknown;
-  const uptime   = data ? data.uptime_pct    : 0;
-  const idlePct  = data ? data.idle_pct      : 0;
-  const stopCnt  = data ? data.manual_stop_count : 0;
-  const wFmt     = data ? data.working_fmt   : "--:--";
-  const iFmt     = data ? data.idle_fmt      : "--:--";
-  const sFmt     = data ? data.manual_stop_fmt : "--:--";
-  const curFmt   = data ? data.current_duration_fmt : "--:--";
-  const updated  = data ? fmtTimestamp(data.last_updated) : "—";
+function cameraTileHTML(ch, camData) {
+  const name      = camData ? escHtml(camData.name) : `Channel ${ch}`;
+  const connected = camData ? camData.connected : false;
+  const working   = camData ? (camData.working || 0)     : 0;
+  const idle      = camData ? (camData.idle || 0)        : 0;
+  const stopped   = camData ? (camData.manual_stop || 0) : 0;
+  const statusCls = connected ? "cam-tile-online" : "cam-tile-offline";
+  const dotCls    = connected ? "dot-online"       : "dot-offline";
 
   return `
-<div class="machine-card state-${state}" id="card-${id}" data-machine-id="${id}">
-  <div class="card-header-row">
-    <span class="machine-id">M-${String(id).padStart(2, "0")}</span>
-    <div class="status-light light-${state}"></div>
+<div class="camera-tile ${statusCls}" id="tile-ch${ch}">
+  <div class="tile-header">
+    <span class="tile-dot ${dotCls}"></span>
+    <span class="tile-name">${name}</span>
+    <span class="tile-ch">CH ${ch}</span>
   </div>
-  <div class="machine-name">${escHtml(name)}</div>
-  <div class="state-badge badge-${state}">
-    <i class="fas ${meta.icon}"></i> ${meta.label}
-  </div>
-  <div class="card-metrics">
-    <div class="metric-row">
-      <span class="metric-label">Current Duration</span>
-      <span class="metric-value" id="cur-dur-${id}">${curFmt}</span>
+  <div class="tile-feed-wrap">
+    <img
+      class="tile-feed"
+      id="feed-ch${ch}"
+      src="/api/stream/${ch}"
+      alt="${name}"
+      onerror="handleFeedError(this, ${ch})"
+    />
+    <div class="tile-counts-overlay" id="overlay-ch${ch}">
+      <span class="count-pill pill-working"  id="cnt-w-${ch}">
+        <i class="fas fa-circle" style="font-size:8px"></i> ${working}
+      </span>
+      <span class="count-pill pill-idle"     id="cnt-i-${ch}">
+        <i class="fas fa-circle" style="font-size:8px"></i> ${idle}
+      </span>
+      <span class="count-pill pill-stop"     id="cnt-s-${ch}">
+        <i class="fas fa-circle" style="font-size:8px"></i> ${stopped}
+      </span>
     </div>
-    <div class="metric-row">
-      <span class="metric-label">Working</span>
-      <span class="metric-value" style="color:#22c55e">${wFmt}</span>
-    </div>
-    <div class="metric-row">
-      <span class="metric-label">Idle</span>
-      <span class="metric-value" style="color:#f59e0b">${iFmt}</span>
-    </div>
-    <div class="metric-row">
-      <span class="metric-label">Manual Stop</span>
-      <span class="metric-value" style="color:#ef4444">${sFmt}</span>
-    </div>
-  </div>
-
-  <div class="uptime-bar-wrap">
-    <div class="uptime-bar-label">
-      <span>Uptime (shift)</span>
-      <strong id="uptime-val-${id}">${uptime}%</strong>
-    </div>
-    <div class="uptime-bar">
-      <div class="uptime-bar-fill" id="uptime-bar-${id}" style="width:${uptime}%"></div>
-    </div>
-  </div>
-
-  <div class="card-footer-row">
-    <span class="stop-count-badge">
-      <i class="fas fa-stop-circle"></i> ${stopCnt} stop${stopCnt !== 1 ? "s" : ""}
-    </span>
-    <span class="last-updated" id="updated-${id}">${updated}</span>
   </div>
 </div>`;
+}
+
+function handleFeedError(img, ch) {
+  img.src = "";
+  img.alt = "Camera Offline";
+  const tile = document.getElementById(`tile-ch${ch}`);
+  if (tile) tile.classList.add("cam-tile-offline");
 }
 
 // ─── Main Poll Tick ───────────────────────────────────────────────────────────
 async function tick() {
   try {
-    const res = await fetch(`${API_BASE}/api/status`, { cache: "no-store" });
+    const res = await fetch(`${API_BASE}/api/cameras`, { cache: "no-store" });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     renderDashboard(data);
   } catch (err) {
-    console.warn("Status fetch failed:", err);
-    setCameraStatus(false, "Connection error");
-    setRefreshLabel("Error — retrying…");
+    console.warn("Poll failed:", err);
+    document.getElementById("last-refresh").textContent = "Connection error — retrying…";
+    updateCamStatus(0, Object.keys(CNC_CHANNELS).length);
   }
 }
 
-// ─── Render Full Dashboard ────────────────────────────────────────────────────
+// ─── Render Dashboard ─────────────────────────────────────────────────────────
 function renderDashboard(data) {
-  updateSummary(data.summary, data.machines);
-  updateCameraStatus(data.camera);
+  const cams    = data.cameras || {};
+  const totals  = data.totals  || {};
+  const connCnt = data.connected_cameras || 0;
+  const total   = totals.working + totals.idle + totals.manual_stop;
+  const effPct  = total > 0 ? Math.round(totals.working / total * 100) : 0;
 
-  for (let id = 1; id <= TOTAL_MACHINES; id++) {
-    const m = data.machines[id] || data.machines[String(id)];
-    if (m) updateMachineCard(id, m);
-  }
+  // KPI bar
+  setText("sum-working",    totals.working     || 0);
+  setText("sum-idle",       totals.idle        || 0);
+  setText("sum-stop",       totals.manual_stop || 0);
+  setText("sum-efficiency", total > 0 ? effPct + "%" : "—");
+  setText("sum-cams",       `${connCnt}/${data.total_cameras || CNC_CHANNELS.length}`);
 
-  fetchAndRenderAlerts();
-  setRefreshLabel(`Updated ${fmtTimestamp(data.timestamp)}`);
-}
-
-// ─── Update KPI Summary Bar ───────────────────────────────────────────────────
-function updateSummary(summary, machines) {
-  setText("sum-working", summary.working);
-  setText("sum-idle",    summary.idle);
-  setText("sum-stop",    summary.manual_stop);
-  setText("sum-off",     summary.off);
-
-  // Floor efficiency = working / (working + idle + stop + off) * 100
-  const active = summary.working + summary.idle + (summary.manual_stop || 0) + summary.off;
-  const eff = active > 0 ? Math.round((summary.working / active) * 100) : 0;
-  setText("sum-efficiency", eff + "%");
-
-  // Flash KPI cards when counts change
-  ["working","idle","manual_stop","off"].forEach(state => {
-    const kpiId = state === "manual_stop" ? "kpi-stop" : `kpi-${state}`;
-    const el = document.getElementById(kpiId);
-    if (el) flashElement(el, 300);
+  // Flash KPI if changed
+  ["sum-working","sum-idle","sum-stop"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el && el.textContent !== String(prevTotals[id] || "")) flashElement(el);
   });
+  prevTotals = { "sum-working": totals.working, "sum-idle": totals.idle, "sum-stop": totals.manual_stop };
+
+  // Camera status dot
+  updateCamStatus(connCnt, data.total_cameras || CNC_CHANNELS.length);
+
+  // Update camera tiles
+  CNC_CHANNELS.forEach(ch => updateCameraTile(ch, cams[String(ch)]));
+
+  // Per-camera counts sidebar
+  renderPerCamCounts(cams);
+
+  // Alerts: detect manual stops from per-camera data
+  detectAlerts(cams);
+
+  setText("last-refresh", `Updated ${fmtTime(data.timestamp)}`);
 }
 
-// ─── Update Single Machine Card ───────────────────────────────────────────────
-function updateMachineCard(id, data) {
-  const card = document.getElementById(`card-${id}`);
-  if (!card) return;
+// ─── Update One Camera Tile ───────────────────────────────────────────────────
+function updateCameraTile(ch, camData) {
+  const tile = document.getElementById(`tile-ch${ch}`);
+  if (!tile) return;
 
-  const state    = data.current_state;
-  const meta     = STATE_META[state] || STATE_META.unknown;
-  const oldState = prevState[id];
+  const connected = camData && camData.connected;
+  const working   = camData ? (camData.working || 0)     : 0;
+  const idle      = camData ? (camData.idle || 0)        : 0;
+  const stopped   = camData ? (camData.manual_stop || 0) : 0;
+  const name      = camData ? camData.name : `Channel ${ch}`;
 
-  // Detect state transition
-  if (oldState !== undefined && oldState !== state) {
-    flashElement(card, 600);
-    if (state === "manual_stop") {
-      showToast(`${data.name} — Manual Stop!`, "danger");
-    } else if (state === "off" && oldState === "working") {
-      showToast(`${data.name} — Turned OFF`, "warning");
-    } else if (state === "working" && (oldState === "manual_stop" || oldState === "idle")) {
-      showToast(`${data.name} — Resumed Working`, "success");
-    }
-  }
-  prevState[id] = state;
+  // Update connection class
+  tile.className = `camera-tile ${connected ? "cam-tile-online" : "cam-tile-offline"}`;
 
-  // Rebuild card content in-place (preserves DOM node, avoids flicker)
-  const stateClasses = Object.keys(STATE_META).map(s => `state-${s}`).join(" ");
-  card.className = `machine-card state-${state}`;
+  // Update dot
+  const dot = tile.querySelector(".tile-dot");
+  if (dot) dot.className = `tile-dot ${connected ? "dot-online" : "dot-offline"}`;
 
-  card.innerHTML = `
-  <div class="card-header-row">
-    <span class="machine-id">M-${String(id).padStart(2, "0")}</span>
-    <div class="status-light light-${state}"></div>
+  // Update name
+  const nameEl = tile.querySelector(".tile-name");
+  if (nameEl) nameEl.textContent = name;
+
+  // Update count pills
+  setText(`cnt-w-${ch}`, working);
+  setText(`cnt-i-${ch}`, idle);
+  setText(`cnt-s-${ch}`, stopped);
+
+  // Refresh feed src periodically so it reconnects after camera offline
+  // The MJPEG src is already streaming; no need to reset unless error occurred.
+}
+
+// ─── Per-Camera Counts Sidebar ────────────────────────────────────────────────
+function renderPerCamCounts(cams) {
+  const el = document.getElementById("per-cam-counts");
+  if (!el) return;
+  let html = "";
+  CNC_CHANNELS.forEach(ch => {
+    const c = cams[String(ch)];
+    const name      = c ? escHtml(c.name) : `Channel ${ch}`;
+    const connected = c && c.connected;
+    const w = c ? (c.working || 0)     : 0;
+    const i = c ? (c.idle || 0)        : 0;
+    const s = c ? (c.manual_stop || 0) : 0;
+
+    html += `
+<div class="per-cam-row ${connected ? "" : "per-cam-offline"}">
+  <div class="per-cam-name">
+    <span class="tile-dot ${connected ? "dot-online" : "dot-offline"}" style="margin-right:6px"></span>
+    ${name}
   </div>
-  <div class="machine-name">${escHtml(data.name)}</div>
-  <div class="state-badge badge-${state}">
-    <i class="fas ${meta.icon}"></i> ${meta.label}
+  <div class="per-cam-pills">
+    <span class="mini-pill pill-working">${w} <span class="pill-label">work</span></span>
+    <span class="mini-pill pill-idle">${i} <span class="pill-label">idle</span></span>
+    <span class="mini-pill pill-stop">${s} <span class="pill-label">stop</span></span>
   </div>
-  <div class="card-metrics">
-    <div class="metric-row">
-      <span class="metric-label">Current Duration</span>
-      <span class="metric-value">${data.current_duration_fmt || "--:--"}</span>
-    </div>
-    <div class="metric-row">
-      <span class="metric-label">Working</span>
-      <span class="metric-value" style="color:#22c55e">${data.working_fmt || "--:--"}</span>
-    </div>
-    <div class="metric-row">
-      <span class="metric-label">Idle</span>
-      <span class="metric-value" style="color:#f59e0b">${data.idle_fmt || "--:--"}</span>
-    </div>
-    <div class="metric-row">
-      <span class="metric-label">Manual Stop</span>
-      <span class="metric-value" style="color:#ef4444">${data.manual_stop_fmt || "--:--"}</span>
-    </div>
-  </div>
-  <div class="uptime-bar-wrap">
-    <div class="uptime-bar-label">
-      <span>Uptime (shift)</span>
-      <strong style="color:#22c55e">${data.uptime_pct}%</strong>
-    </div>
-    <div class="uptime-bar">
-      <div class="uptime-bar-fill" style="width:${data.uptime_pct}%"></div>
-    </div>
-  </div>
-  <div class="card-footer-row">
-    <span class="stop-count-badge">
-      <i class="fas fa-stop-circle"></i>
-      ${data.manual_stop_count} stop${data.manual_stop_count !== 1 ? "s" : ""}
-    </span>
-    <span class="last-updated">${fmtTimestamp(data.last_updated)}</span>
-  </div>`;
+</div>`;
+  });
+  el.innerHTML = html || `<div class="text-muted text-center py-3 small">No cameras</div>`;
 }
 
 // ─── Alerts ───────────────────────────────────────────────────────────────────
-async function fetchAndRenderAlerts() {
-  try {
-    const res = await fetch(`${API_BASE}/api/alerts`, { cache: "no-store" });
-    if (!res.ok) return;
-    const data = await res.json();
-    renderAlerts(data.alerts || []);
-  } catch (_) {}
+function detectAlerts(cams) {
+  CNC_CHANNELS.forEach(ch => {
+    const c = cams[String(ch)];
+    if (!c) return;
+    if (c.manual_stop > 0) {
+      const key = `stop-${ch}-${Math.floor(Date.now() / 30000)}`; // dedupe per 30s window
+      if (!seenAlerts.has(key)) {
+        seenAlerts.add(key);
+        addAlert(`${c.name}: ${c.manual_stop} machine(s) in Manual Stop`, "high");
+        showToast(`${c.name} — Manual Stop detected!`, "danger");
+      }
+    }
+  });
 }
 
-function renderAlerts(alerts) {
+function addAlert(msg, severity) {
   const log   = document.getElementById("alert-log");
   const badge = document.getElementById("alert-badge");
   if (!log) return;
 
-  const newAlerts = alerts.filter(a => {
-    const key = a.timestamp + a.machine_name;
-    if (seenAlerts.has(key)) return false;
-    seenAlerts.add(key);
-    return true;
-  });
+  const noMsg = log.querySelector(".no-alerts-msg");
+  if (noMsg) noMsg.remove();
 
-  if (newAlerts.length > 0) {
-    alertCount += newAlerts.length;
-    if (badge) badge.textContent = alertCount;
+  alertCount++;
+  if (badge) badge.textContent = alertCount;
 
-    const noMsg = log.querySelector(".no-alerts-msg");
-    if (noMsg) noMsg.remove();
+  const div = document.createElement("div");
+  div.className = `alert-item alert-severity-${severity}`;
+  div.innerHTML = `
+    <i class="fas fa-exclamation-circle alert-icon"></i>
+    <div class="alert-content">
+      <div class="alert-msg">${escHtml(msg)}</div>
+      <div class="alert-time">${fmtTime(new Date().toISOString())}</div>
+    </div>`;
+  log.prepend(div);
 
-    newAlerts.forEach(a => {
-      const div = document.createElement("div");
-      div.className = `alert-item alert-severity-${a.severity || "high"}`;
-      div.innerHTML = `
-        <i class="fas fa-exclamation-circle alert-icon"></i>
-        <div class="alert-content">
-          <div class="alert-msg">${escHtml(a.message)}</div>
-          <div class="alert-time">${fmtTimestamp(a.timestamp)}</div>
-        </div>`;
-      log.prepend(div);
-    });
-  }
-
-  // Cap alert log at 50 items
+  // Cap at 50 entries
   const items = log.querySelectorAll(".alert-item");
   items.forEach((el, i) => { if (i >= 50) el.remove(); });
 }
 
 function clearAlerts() {
-  const log = document.getElementById("alert-log");
+  const log   = document.getElementById("alert-log");
   const badge = document.getElementById("alert-badge");
-  if (log) {
-    log.innerHTML = `<div class="no-alerts-msg">
-      <i class="fas fa-check-circle text-success me-2"></i>Cleared
-    </div>`;
-  }
-  seenAlerts.clear();
+  if (log) log.innerHTML = `<div class="no-alerts-msg"><i class="fas fa-check-circle text-success me-2"></i>Cleared</div>`;
   alertCount = 0;
+  seenAlerts.clear();
   if (badge) badge.textContent = "0";
 }
 
-// ─── Camera Status ────────────────────────────────────────────────────────────
-function updateCameraStatus(cam) {
-  setCameraStatus(cam && cam.connected, cam ? cam.error : "Offline");
-}
-
-function setCameraStatus(online, errMsg) {
+// ─── Camera Status Dot ────────────────────────────────────────────────────────
+function updateCamStatus(connected, total) {
   const dot   = document.getElementById("cam-dot");
   const label = document.getElementById("cam-label");
   if (!dot) return;
-  if (online) {
+  if (connected > 0) {
     dot.className   = "cam-dot cam-online";
-    label.textContent = "Camera OK";
+    label.textContent = `${connected}/${total} Cams`;
   } else {
     dot.className   = "cam-dot cam-offline";
-    label.textContent = errMsg || "Offline";
+    label.textContent = "No Cams";
   }
 }
 
-// ─── Toast Notifications ──────────────────────────────────────────────────────
+// ─── Toast ────────────────────────────────────────────────────────────────────
 function showToast(msg, type) {
   const container = document.getElementById("toast-container");
   if (!container) return;
-
-  const iconMap = {
-    danger:  "fa-exclamation-triangle",
-    warning: "fa-exclamation-circle",
-    success: "fa-check-circle",
-    info:    "fa-info-circle",
-  };
-  const colorMap = {
-    danger:  "#ef4444",
-    warning: "#f59e0b",
-    success: "#22c55e",
-    info:    "#38bdf8",
-  };
-
+  const colorMap = { danger: "#ef4444", warning: "#f59e0b", success: "#22c55e", info: "#38bdf8" };
+  const iconMap  = { danger: "fa-exclamation-triangle", warning: "fa-exclamation-circle",
+                     success: "fa-check-circle", info: "fa-info-circle" };
   const el = document.createElement("div");
   el.className = "toast-notif";
   el.style.borderColor = colorMap[type] || "#64748b";
-  el.innerHTML = `
-    <i class="fas ${iconMap[type] || "fa-bell"}" style="color:${colorMap[type]};font-size:16px"></i>
-    <span>${escHtml(msg)}</span>`;
+  el.innerHTML = `<i class="fas ${iconMap[type] || "fa-bell"}" style="color:${colorMap[type]};font-size:16px"></i>
+                  <span>${escHtml(msg)}</span>`;
   container.appendChild(el);
-
-  setTimeout(() => {
-    el.classList.add("toast-exit");
-    setTimeout(() => el.remove(), 400);
-  }, 4500);
+  setTimeout(() => { el.classList.add("toast-exit"); setTimeout(() => el.remove(), 400); }, 4500);
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-function fmtTimestamp(iso) {
-  if (!iso) return "—";
-  try {
-    const d = new Date(iso);
-    return d.toLocaleTimeString("en-GB", { hour12: false });
-  } catch (_) { return iso; }
-}
-
 function setText(id, val) {
   const el = document.getElementById(id);
   if (el) el.textContent = val;
 }
 
-function setRefreshLabel(text) {
-  const el = document.getElementById("last-refresh");
-  if (el) el.textContent = text;
+function fmtTime(iso) {
+  if (!iso) return "—";
+  try { return new Date(iso).toLocaleTimeString("en-GB", { hour12: false }); }
+  catch (_) { return iso; }
 }
 
-function flashElement(el, durationMs) {
+function flashElement(el) {
   el.style.transition = "opacity 0.15s";
-  el.style.opacity = "0.5";
-  setTimeout(() => {
-    el.style.opacity = "1";
-  }, durationMs / 2);
+  el.style.opacity    = "0.4";
+  setTimeout(() => { el.style.opacity = "1"; }, 200);
 }
 
 function escHtml(str) {
