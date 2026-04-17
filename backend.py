@@ -548,27 +548,89 @@ def api_update_roi(machine_id):
     return jsonify({"success": True, "roi": machine_rois[machine_id]})
 
 
+def _make_offline_frame(msg: str = "Camera Offline") -> bytes:
+    """Return a JPEG bytes placeholder shown when camera is unavailable."""
+    img = np.zeros((480, 640, 3), dtype=np.uint8)
+    img[:] = (20, 20, 30)
+    cv2.putText(img, msg, (int(640/2 - len(msg)*7), 240),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (60, 60, 220), 2, cv2.LINE_AA)
+    cv2.putText(img, "CNC Monitor — Waiting for camera...", (60, 300),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (120, 120, 120), 1, cv2.LINE_AA)
+    _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 60])
+    return buf.tobytes()
+
+
+_OFFLINE_JPEG = None  # cached once
+
+
 @app.route("/api/stream")
 def api_stream():
     def generate():
+        global _OFFLINE_JPEG
+        if _OFFLINE_JPEG is None:
+            _OFFLINE_JPEG = _make_offline_frame()
+
         while True:
-            frame = camera.get_frame()
-            if frame is not None:
-                out = processor.process(frame) or frame
-            else:
-                out = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(out, "Camera Offline", (150, 240),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 220), 2, cv2.LINE_AA)
-            ret, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 72])
-            if ret:
+            try:
+                frame = camera.get_frame()
+                if frame is not None:
+                    try:
+                        out = processor.process(frame)
+                        if out is None:
+                            out = frame
+                    except Exception as proc_err:
+                        logger.debug(f"Process error: {proc_err}")
+                        out = frame
+                    ret, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 72])
+                    jpeg = buf.tobytes() if ret else _OFFLINE_JPEG
+                else:
+                    jpeg = _OFFLINE_JPEG
+
                 yield (
                     b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
-                    + buf.tobytes()
+                    + jpeg
                     + b"\r\n"
                 )
-            time.sleep(0.08)
+            except GeneratorExit:
+                break
+            except Exception as e:
+                logger.debug(f"Stream generator error: {e}")
+                yield (
+                    b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                    + _OFFLINE_JPEG
+                    + b"\r\n"
+                )
+            time.sleep(0.1)
 
-    return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
+    return Response(
+        generate(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
+
+
+@app.route("/api/test-camera")
+def api_test_camera():
+    """Test camera connection — returns which RTSP URL worked or failed."""
+    results = []
+    for url in CAMERA_CONFIG["rtsp_urls"]:
+        try:
+            cap = cv2.VideoCapture(url)
+            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 4000)
+            opened = cap.isOpened()
+            if opened:
+                ret, _ = cap.read()
+                results.append({"url": url, "opened": True, "frame": ret})
+            else:
+                results.append({"url": url, "opened": False, "frame": False})
+            cap.release()
+        except Exception as e:
+            results.append({"url": url, "opened": False, "error": str(e)})
+    return jsonify({"results": results, "camera_status": camera.status()})
 
 
 @app.route("/api/frame")
