@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CNC Machine Monitor | Factory Intelligence Dashboard</title>
+  <link
+    href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css"
+    rel="stylesheet"
+  />
+  <link
+    href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"
+    rel="stylesheet"
+  />
+  <link href="style.css" rel="stylesheet" />
+</head>
+<body>
+
+  <!-- ── Top Navigation Bar ─────────────────────────────────────────── -->
+  <nav class="top-nav">
+    <div class="nav-left">
+      <div class="brand-icon"><i class="fas fa-industry"></i></div>
+      <div class="brand-text">
+        <span class="brand-title">CNC MACHINE MONITOR</span>
+        <span class="brand-sub">Factory Floor Intelligence System &mdash; Real-Time</span>
+      </div>
+    </div>
+
+    <div class="nav-center">
+      <div class="shift-progress-wrap">
+        <div class="d-flex justify-content-between mb-1">
+          <span class="small text-muted">Shift Progress</span>
+          <span class="small text-white" id="shift-pct-label">0%</span>
+        </div>
+        <div class="progress shift-progress">
+          <div class="progress-bar bg-warning" id="shift-progress-bar" style="width:0%"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="nav-right">
+      <div class="clock-block">
+        <div id="live-clock" class="live-clock">00:00:00</div>
+        <div id="live-date" class="live-date">Loading…</div>
+      </div>
+      <div class="cam-indicator-wrap">
+        <div id="cam-dot" class="cam-dot cam-offline"></div>
+        <span id="cam-label" class="cam-label">Camera</span>
+      </div>
+    </div>
+  </nav>
+
+  <!-- ── Summary KPI Bar ────────────────────────────────────────────── -->
+  <div class="kpi-bar">
+    <div class="kpi-card kpi-working" id="kpi-working">
+      <div class="kpi-icon"><i class="fas fa-cog fa-spin"></i></div>
+      <div class="kpi-body">
+        <div class="kpi-count" id="sum-working">0</div>
+        <div class="kpi-label">Working</div>
+      </div>
+    </div>
+    <div class="kpi-card kpi-idle" id="kpi-idle">
+      <div class="kpi-icon"><i class="fas fa-hourglass-half"></i></div>
+      <div class="kpi-body">
+        <div class="kpi-count" id="sum-idle">0</div>
+        <div class="kpi-label">Idle</div>
+      </div>
+    </div>
+    <div class="kpi-card kpi-stop" id="kpi-stop">
+      <div class="kpi-icon"><i class="fas fa-exclamation-triangle"></i></div>
+      <div class="kpi-body">
+        <div class="kpi-count" id="sum-stop">0</div>
+        <div class="kpi-label">Manual Stop</div>
+      </div>
+    </div>
+    <div class="kpi-card kpi-off" id="kpi-off">
+      <div class="kpi-icon"><i class="fas fa-power-off"></i></div>
+      <div class="kpi-body">
+        <div class="kpi-count" id="sum-off">0</div>
+        <div class="kpi-label">OFF</div>
+      </div>
+    </div>
+    <div class="kpi-card kpi-efficiency">
+      <div class="kpi-icon"><i class="fas fa-chart-line"></i></div>
+      <div class="kpi-body">
+        <div class="kpi-count" id="sum-efficiency">0%</div>
+        <div class="kpi-label">Floor Efficiency</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Main Layout ────────────────────────────────────────────────── -->
+  <div class="main-layout">
+
+    <!-- Machine Grid -->
+    <div class="machine-grid-area">
+      <div class="section-header">
+        <i class="fas fa-th me-2 text-warning"></i>
+        Machine Status Overview
+        <span class="badge-live ms-2">LIVE</span>
+        <span class="last-refresh ms-auto" id="last-refresh">Connecting…</span>
+      </div>
+      <div class="machine-grid" id="machine-grid">
+        <!-- Cards injected by app.js -->
+      </div>
+    </div>
+
+    <!-- Right Sidebar -->
+    <div class="sidebar">
+
+      <!-- Live Feed -->
+      <div class="panel-card mb-3">
+        <div class="panel-header">
+          <i class="fas fa-video me-2 text-warning"></i>Live Camera Feed
+          <span class="badge-live ms-2">LIVE</span>
+        </div>
+        <div class="panel-body p-0">
+          <img
+            id="live-feed"
+            src="/api/stream"
+            alt="Live Camera Feed"
+            class="live-feed-img"
+            onerror="this.src=''; this.alt='Camera Offline';"
+          />
+        </div>
+      </div>
+
+      <!-- Alert Log -->
+      <div class="panel-card flex-grow-1">
+        <div class="panel-header">
+          <i class="fas fa-bell me-2 text-danger"></i>Alert Log
+          <span class="alert-badge ms-2" id="alert-badge">0</span>
+          <button class="btn-clear-alerts ms-auto" id="btn-clear-alerts" onclick="clearAlerts()">
+            <i class="fas fa-trash-alt"></i>
+          </button>
+        </div>
+        <div class="panel-body panel-alerts" id="alert-log">
+          <div class="no-alerts-msg">
+            <i class="fas fa-check-circle text-success me-2"></i>No active alerts
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ── Toast Notification Container ─────────────────────────────── -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
