@@ -32,28 +32,43 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Camera Configuration ─────────────────────────────────────────────────────
+# CP PLUS NVR at 192.168.4.10
+# Channel numbers visible in NVR sidebar (1-indexed). Change ACTIVE_CHANNEL
+# to whichever channel shows the most CNC machines with indicator lights.
+# Channels seen in NVR: CAD CAM=1, OPC CENTER=2, CONFERENCE=3, PANNEL AREA=4,
+#   PASSAGE 1=5, CNC 2=6, CNC 2 PASSAGE=7, CNC 1 PASSAGE=8, CNC 1=9
+ACTIVE_CHANNEL = 9   # <-- change this to the channel number that shows all CNCs
+
 CAMERA_CONFIG = {
     "base_url": "https://192.168.4.10",
     "username": "admin",
     "password": "Admin@1234",
     "reconnect_delay": 5,
     "frame_timeout": 10,
+    # CP PLUS NVR uses Dahua-compatible RTSP format:
+    # rtsp://user:pass@ip:554/cam/realmonitor?channel=N&subtype=0
+    "rtsp_urls": [
+        # Main stream — try each CNC channel
+        f"rtsp://admin:Admin@1234@192.168.4.10:554/cam/realmonitor?channel={ACTIVE_CHANNEL}&subtype=0",
+        f"rtsp://admin:Admin@1234@192.168.4.10:554/cam/realmonitor?channel={ACTIVE_CHANNEL}&subtype=1",
+        # Try channels 6–9 (CNC 2, CNC 2 PASSAGE, CNC 1 PASSAGE, CNC 1)
+        "rtsp://admin:Admin@1234@192.168.4.10:554/cam/realmonitor?channel=6&subtype=0",
+        "rtsp://admin:Admin@1234@192.168.4.10:554/cam/realmonitor?channel=7&subtype=0",
+        "rtsp://admin:Admin@1234@192.168.4.10:554/cam/realmonitor?channel=8&subtype=0",
+        "rtsp://admin:Admin@1234@192.168.4.10:554/cam/realmonitor?channel=9&subtype=0",
+        # Alternative CP PLUS NVR formats
+        f"rtsp://admin:Admin@1234@192.168.4.10:554/ch{ACTIVE_CHANNEL:02d}/main/av_stream",
+        f"rtsp://admin:Admin@1234@192.168.4.10:554/Streaming/Channels/{ACTIVE_CHANNEL}01",
+    ],
+    # CP PLUS HTTP snapshot fallback
     "stream_paths": [
+        f"/cgi-bin/snapshot.cgi?channel={ACTIVE_CHANNEL}",
+        f"/cgi-bin/mjpg/video.cgi?channel={ACTIVE_CHANNEL}&subtype=0",
+        f"/onvif/snapshot?channel={ACTIVE_CHANNEL}",
+        "/cgi-bin/snapshot.cgi",
+        "/cgi-bin/mjpg/video.cgi",
         "/video",
         "/stream",
-        "/cgi-bin/mjpg/video.cgi",
-        "/mjpg/video.mjpg",
-        "/axis-cgi/mjpg/video.cgi",
-        "/VideoInput/1/mjpeg/1",
-        "/onvif/snapshot",
-        "/snap.jpg",
-    ],
-    "rtsp_urls": [
-        "rtsp://admin:Admin@1234@192.168.4.10:554/stream1",
-        "rtsp://admin:Admin@1234@192.168.4.10:554/Streaming/Channels/1",
-        "rtsp://admin:Admin@1234@192.168.4.10:554/live/ch0",
-        "rtsp://admin:Admin@1234@192.168.4.10:554/h264/ch1/main/av_stream",
-        "rtsp://admin:Admin@1234@192.168.4.10:554/channel1",
     ],
 }
 
