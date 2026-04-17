@@ -12,6 +12,7 @@ import threading
 import time
 import logging
 import os
+import json
 from datetime import datetime, timedelta
 from collections import deque
 from flask import Flask, jsonify, Response, send_from_directory, request
@@ -38,17 +39,36 @@ NVR_USER     = "admin"
 NVR_PASSWORD = "Admin@1234"
 NVR_PORT     = 554
 
-# ─── CNC Camera Channels ─────────────────────────────────────────────────────
-# Map of NVR channel number → display name.
-# Based on CP PLUS NVR sidebar order (adjust if your numbering differs).
-# Typical CP PLUS / Dahua format: channel=N in sidebar = N in RTSP URL.
-# Run /api/scan-channels to auto-discover which channels have CNC floors.
-CNC_CAMERAS = {
-    6:  "CNC 2",
-    7:  "CNC 2 PASSAGE",
-    8:  "CNC 1 PASSAGE",
-    9:  "CNC 1",
+# ─── Camera Config Persistence ───────────────────────────────────────────────
+CAMERAS_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cameras.json")
+
+DEFAULT_CNC_CAMERAS = {
+    6: "CNC 2",
+    7: "CNC 2 PASSAGE",
+    8: "CNC 1 PASSAGE",
+    9: "CNC 1",
 }
+
+def load_camera_config() -> dict:
+    """Load saved camera selection from cameras.json. Falls back to defaults."""
+    if os.path.exists(CAMERAS_CONFIG_FILE):
+        try:
+            with open(CAMERAS_CONFIG_FILE) as f:
+                data = json.load(f)
+            # Convert string keys back to int
+            return {int(k): v for k, v in data.get("channels", {}).items()}
+        except Exception as e:
+            logger.warning(f"Could not load cameras.json: {e}")
+    return {}
+
+def save_camera_config(channels: dict):
+    """Persist selected channels to cameras.json."""
+    with open(CAMERAS_CONFIG_FILE, "w") as f:
+        json.dump({"channels": {str(k): v for k, v in channels.items()}}, f, indent=2)
+    logger.info(f"Camera config saved: {channels}")
+
+# Load saved selection (empty dict = not configured yet → show setup page)
+CNC_CAMERAS: dict = load_camera_config()
 
 def rtsp_urls_for_channel(ch: int) -> list:
     """Return ordered list of RTSP URLs to try for a CP PLUS NVR channel."""
@@ -305,7 +325,8 @@ class CameraManager:
 
 
 # ─── Global Camera Pool ────────────────────────────────────────────────────────
-cameras: dict[int, CameraManager] = {
+# Empty dict if not configured yet — setup page will populate it.
+cameras: dict = {
     ch: CameraManager(ch, name) for ch, name in CNC_CAMERAS.items()
 }
 
@@ -330,7 +351,15 @@ def _make_offline_jpeg(msg: str = "Camera Offline") -> bytes:
 # ─── Routes ───────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
+    # If no cameras configured yet, send user to setup page
+    if not cameras:
+        from flask import redirect
+        return redirect("/setup")
     return send_from_directory(BASE_DIR, "dashboard.html")
+
+@app.route("/setup")
+def setup_page():
+    return send_from_directory(BASE_DIR, "setup.html")
 
 @app.route("/style.css")
 def serve_css():
@@ -339,6 +368,85 @@ def serve_css():
 @app.route("/app.js")
 def serve_js():
     return send_from_directory(BASE_DIR, "app.js")
+
+@app.route("/setup.js")
+def serve_setup_js():
+    return send_from_directory(BASE_DIR, "setup.js")
+
+
+@app.route("/api/scan-snapshot/<int:channel>")
+def api_scan_snapshot(channel):
+    """
+    Grab a single JPEG frame from the given NVR channel.
+    Used by the setup page to preview each channel.
+    Times out quickly — returns offline placeholder if no feed.
+    """
+    global _OFFLINE_JPEG
+    if _OFFLINE_JPEG is None:
+        _OFFLINE_JPEG = _make_offline_jpeg()
+
+    url = (f"rtsp://{NVR_USER}:{NVR_PASSWORD}@{NVR_HOST}:{NVR_PORT}"
+           f"/cam/realmonitor?channel={channel}&subtype=1")
+    try:
+        cap = cv2.VideoCapture(url)
+        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+        cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+        ret, frame = cap.read()
+        cap.release()
+        if ret and frame is not None:
+            # Resize to 480×270 for faster transfer
+            frame = cv2.resize(frame, (480, 270))
+            ret2, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
+            if ret2:
+                return Response(buf.tobytes(), mimetype="image/jpeg",
+                                headers={"Cache-Control": "no-cache"})
+    except Exception as e:
+        logger.debug(f"scan-snapshot ch{channel}: {e}")
+
+    # Return offline placeholder
+    placeholder = np.zeros((270, 480, 3), dtype=np.uint8)
+    placeholder[:] = (15, 15, 25)
+    cv2.putText(placeholder, f"Ch {channel}: No Signal", (100, 135),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (60, 60, 100), 1, cv2.LINE_AA)
+    _, buf = cv2.imencode(".jpg", placeholder, [cv2.IMWRITE_JPEG_QUALITY, 50])
+    return Response(buf.tobytes(), mimetype="image/jpeg",
+                    headers={"Cache-Control": "no-cache"})
+
+
+@app.route("/api/config/save", methods=["POST"])
+def api_save_config():
+    """
+    Save selected camera channels and restart camera managers.
+    Body: {"channels": {"1": "CAD CAM", "6": "CNC 2", ...}}
+    """
+    global cameras, CNC_CAMERAS
+    data = request.get_json(force=True) or {}
+    new_channels_raw = data.get("channels", {})
+
+    if not new_channels_raw:
+        return jsonify({"error": "No channels provided"}), 400
+
+    new_channels = {int(k): str(v) for k, v in new_channels_raw.items()}
+
+    # Stop all running cameras
+    for cam in cameras.values():
+        cam.stop()
+
+    # Save to disk
+    save_camera_config(new_channels)
+    CNC_CAMERAS = new_channels
+
+    # Start new camera managers
+    cameras = {ch: CameraManager(ch, name) for ch, name in new_channels.items()}
+    for cam in cameras.values():
+        cam.start()
+
+    logger.info(f"Camera selection updated: {new_channels}")
+    return jsonify({
+        "success":  True,
+        "channels": new_channels,
+        "count":    len(new_channels),
+    })
 
 
 @app.route("/api/cameras")
@@ -517,12 +625,18 @@ def api_set_camera_channels():
 if __name__ == "__main__":
     logger.info("=" * 60)
     logger.info("CNC Machine Monitor — Multi-Camera Edition")
-    logger.info(f"Monitoring {len(cameras)} cameras: {list(CNC_CAMERAS.values())}")
+    if cameras:
+        logger.info(f"Loaded {len(cameras)} saved cameras: {list(CNC_CAMERAS.values())}")
+    else:
+        logger.info("No cameras configured — open http://0.0.0.0:5000/setup to select cameras")
     logger.info("=" * 60)
 
     for cam in cameras.values():
         cam.start()
 
-    time.sleep(2)
-    logger.info("Dashboard available at http://0.0.0.0:5000")
+    if cameras:
+        time.sleep(2)
+
+    logger.info("Dashboard: http://0.0.0.0:5000")
+    logger.info("Setup:     http://0.0.0.0:5000/setup")
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True, use_reloader=False)
