@@ -139,6 +139,23 @@ html, body {
   margin-top: 2px;
 }
 
+.btn-setup {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid var(--border-accent);
+  border-radius: 7px;
+  color: var(--c-text);
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: none;
+  transition: background 0.2s;
+  white-space: nowrap;
+}
+.btn-setup:hover { background: rgba(255,255,255,0.14); color: #fff; }
+
 .cam-indicator-wrap {
   display: flex;
   flex-direction: column;
