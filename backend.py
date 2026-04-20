@@ -84,73 +84,74 @@ def rtsp_urls_for_channel(ch: int) -> list:
         f"rtsp://{u}:{p}@{h}:{NVR_PORT}/ch{ch:02d}/0",
     ]
 
-# ─── Indicator Light Detection (Blob-based, No Fixed ROI) ────────────────────
-# Indicator lights are small bright saturated spots.
-# Area range is set relative to frame size so it works across resolutions.
-# Indicator lights: small saturated LED domes viewed from overhead.
-# RTSP H.264 compression reduces apparent saturation, so keep color ranges relaxed.
-# The PRIMARY filter against floor tape / reflections is CIRCULARITY (tape ≈ 0.01).
+# ─── Indicator Light Detection ───────────────────────────────────────────────
+# Strategy: Wide HSV ranges so overhead/RTSP-compressed lights aren't missed.
+# Primary discriminators:
+#   1. Circularity ≥ 0.25  — rejects floor tape (circ ≈ 0.01) and elongated objects
+#   2. Local saturation contrast — indicator light on a gray machine has MUCH higher
+#      saturation than its surrounding machine surface. A large colored object (green fan,
+#      yellow tool) has similar saturation to its own surroundings → rejected.
 LIGHT_SPECS = {
     "working": {  # Steady Green = Running
         "ranges": [
-            (np.array([38, 70, 100]), np.array([88, 255, 255])),
+            (np.array([38, 30, 50]), np.array([88, 255, 255])),
         ],
         "color_bgr": (0, 220, 60),
     },
-    "idle": {  # Yellow = Idle
-        # S≥90 excludes matte floor tape (~S60-80) while still catching LED after compression
+    "idle": {  # Yellow/Amber = Idle
         "ranges": [
-            (np.array([18, 90, 110]), np.array([35, 255, 255])),
+            (np.array([15, 50, 60]), np.array([38, 255, 255])),
         ],
         "color_bgr": (0, 200, 240),
     },
     "manual_stop": {  # Red = Manual Stop / Alarm
         "ranges": [
-            (np.array([0,  90,  90]), np.array([10, 255, 255])),
-            (np.array([165, 90,  90]), np.array([180, 255, 255])),
+            (np.array([0,  50, 50]), np.array([12, 255, 255])),
+            (np.array([163, 50, 50]), np.array([180, 255, 255])),
         ],
         "color_bgr": (50, 50, 240),
     },
     "process_finish": {  # Blinking Green = Process Complete (derived in CameraManager)
-        "ranges": [],  # No direct HSV — detected via blink analysis
-        "color_bgr": (255, 210, 0),  # Cyan to distinguish from steady green
+        "ranges": [],
+        "color_bgr": (255, 210, 0),
     },
 }
 
-_MORPH_OPEN_K  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+_MORPH_OPEN_K  = cv2.getStructuringElement(cv2.MORPH_CROSS,   (3, 3))
 _MORPH_CLOSE_K = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+_SURR_KERNEL   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35))
 
 
 def detect_indicator_lights(frame: np.ndarray) -> dict:
     """
-    Scan the full frame for CNC indicator light blobs.
-    Filters aggressively to only match small, bright, circular LED dome lights.
-    Returns {"working": N, "idle": N, "manual_stop": N, "process_finish": N, "blobs": [...]}
+    Detect CNC indicator light blobs using color + shape + local saturation contrast.
+
+    Key insight: a stack light is a small colored dome on a GRAY machine surface.
+    Its saturation is much higher than the surrounding machine body.
+    A large colored object (fan, tool) has similar saturation to its own surroundings.
     """
     if frame is None or frame.size == 0:
         return {"working": 0, "idle": 0, "manual_stop": 0, "process_finish": 0, "blobs": []}
 
-    h, w = frame.shape[:2]
-    total_px = h * w
-    # Indicator lights from overhead: small circles, ~15-50px radius
-    min_area = max(10, int(total_px * 0.000010))   # ~10 px² minimum
-    max_area = int(total_px * 0.0020)              # ≤0.20% — tighter than original but not too small
+    h_img, w_img = frame.shape[:2]
+    total_px = h_img * w_img
+    min_area = max(8,  int(total_px * 0.000008))
+    max_area = int(total_px * 0.003)
 
-    blurred   = cv2.GaussianBlur(frame, (3, 3), 0)
-    hsv       = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
-    v_channel = hsv[:, :, 2]  # brightness channel for LED validation
+    blurred = cv2.GaussianBlur(frame, (5, 5), 0)
+    hsv     = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+    s_ch    = hsv[:, :, 1]
 
     results = {"working": 0, "idle": 0, "manual_stop": 0, "process_finish": 0, "blobs": []}
 
     for state, spec in LIGHT_SPECS.items():
         if not spec["ranges"]:
-            continue  # process_finish derived later
+            continue
 
         mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
         for lo, hi in spec["ranges"]:
             mask = cv2.bitwise_or(mask, cv2.inRange(hsv, lo, hi))
 
-        # Open removes single-pixel noise; close fills small holes inside the dome
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  _MORPH_OPEN_K)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _MORPH_CLOSE_K)
 
@@ -161,25 +162,28 @@ def detect_indicator_lights(frame: np.ndarray) -> dict:
             if not (min_area <= area <= max_area):
                 continue
 
-            perimeter = cv2.arcLength(cnt, True)
-            if perimeter == 0:
+            perim = cv2.arcLength(cnt, True)
+            if perim == 0:
                 continue
-            circularity = 4 * np.pi * area / (perimeter ** 2)
-            # Floor tape segments have circularity ≈ 0.01–0.08; real light domes ≥ 0.25
-            if circularity < 0.25:
-                continue
-
-            # Aspect ratio: dome lights are roughly square
-            x, y, bw, bh = cv2.boundingRect(cnt)
-            aspect = bw / bh if bh > 0 else 0
-            if not (0.30 <= aspect <= 3.0):
+            circ = 4 * np.pi * area / (perim ** 2)
+            if circ < 0.25:           # floor tape ≈ 0.01; round lights ≥ 0.4
                 continue
 
-            # Brightness gate: blob pixels must be reasonably bright (not dark shadow areas)
-            cnt_mask = np.zeros(v_channel.shape, dtype=np.uint8)
-            cv2.drawContours(cnt_mask, [cnt], -1, 255, -1)
-            mean_v = cv2.mean(v_channel, mask=cnt_mask)[0]
-            if mean_v < 100:
+            xb, yb, bw, bh = cv2.boundingRect(cnt)
+            if bh == 0 or not (0.30 <= bw / bh <= 3.0):
+                continue
+
+            # Local saturation contrast — the decisive filter
+            blob_mask = np.zeros(s_ch.shape, dtype=np.uint8)
+            cv2.drawContours(blob_mask, [cnt], -1, 255, -1)
+
+            blob_s  = cv2.mean(s_ch, mask=blob_mask)[0]
+            nb_mask = cv2.dilate(blob_mask, _SURR_KERNEL)
+            surr_s  = cv2.mean(s_ch, mask=cv2.bitwise_xor(nb_mask, blob_mask))[0]
+
+            # Light on gray surface: blob_s >> surr_s
+            # Fan body: blob_s ≈ surr_s (same object)
+            if blob_s - surr_s < 18:
                 continue
 
             (cx, cy), radius = cv2.minEnclosingCircle(cnt)
