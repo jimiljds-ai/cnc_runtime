@@ -85,29 +85,29 @@ def rtsp_urls_for_channel(ch: int) -> list:
     ]
 
 # ─── Indicator Light Detection ───────────────────────────────────────────────
-# Strategy: Wide HSV ranges so overhead/RTSP-compressed lights aren't missed.
-# Primary discriminators:
-#   1. Circularity ≥ 0.25  — rejects floor tape (circ ≈ 0.01) and elongated objects
-#   2. Local saturation contrast — indicator light on a gray machine has MUCH higher
-#      saturation than its surrounding machine surface. A large colored object (green fan,
-#      yellow tool) has similar saturation to its own surroundings → rejected.
+# Physical model:
+#   Indicator lights are SELF-LUMINOUS LEDs → brighter than the machine surface around them.
+#   Floor tape reflects ambient light → same brightness as surrounding floor → no contrast.
+#   Large colored objects (fan, tools) → vary, but usually large (caught by max_area).
+#
+# Filter pipeline:
+#   1. HSV color mask  (wide ranges — RTSP compression degrades saturation)
+#   2. Circularity ≥ 0.30  (tape segments ≈ 0.01; round dome ≥ 0.4)
+#   3. Size limits  (small blob = single indicator dome)
+#   4. Local brightness contrast: blob must be brighter than surrounding area by ≥ 20 V-units
 LIGHT_SPECS = {
     "working": {  # Steady Green = Running
-        "ranges": [
-            (np.array([38, 30, 50]), np.array([88, 255, 255])),
-        ],
+        "ranges": [(np.array([38, 40, 60]), np.array([88, 255, 255]))],
         "color_bgr": (0, 220, 60),
     },
     "idle": {  # Yellow/Amber = Idle
-        "ranges": [
-            (np.array([15, 50, 60]), np.array([38, 255, 255])),
-        ],
+        "ranges": [(np.array([15, 55, 70]), np.array([38, 255, 255]))],
         "color_bgr": (0, 200, 240),
     },
-    "manual_stop": {  # Red = Manual Stop / Alarm
+    "manual_stop": {  # Red = Manual Stop
         "ranges": [
-            (np.array([0,  50, 50]), np.array([12, 255, 255])),
-            (np.array([163, 50, 50]), np.array([180, 255, 255])),
+            (np.array([0,  55, 60]), np.array([12, 255, 255])),
+            (np.array([163, 55, 60]), np.array([180, 255, 255])),
         ],
         "color_bgr": (50, 50, 240),
     },
@@ -119,27 +119,29 @@ LIGHT_SPECS = {
 
 _MORPH_OPEN_K  = cv2.getStructuringElement(cv2.MORPH_CROSS,   (3, 3))
 _MORPH_CLOSE_K = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-_SURR_KERNEL   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35))
+_NB_KERNEL     = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
 
 
 def detect_indicator_lights(frame: np.ndarray) -> dict:
     """
-    Detect CNC indicator light blobs using color + shape + local saturation contrast.
+    Detect CNC indicator light blobs.
 
-    Key insight: a stack light is a small colored dome on a GRAY machine surface.
-    Its saturation is much higher than the surrounding machine body.
-    A large colored object (fan, tool) has similar saturation to its own surroundings.
+    The decisive filter is LOCAL BRIGHTNESS CONTRAST:
+      - LED on machine surface → blob V >> surrounding V  (self-luminous)
+      - Floor tape on floor    → blob V ≈ surrounding V  (passive reflection)
+    This cleanly separates lights from tape, cardboard, tools, etc.
     """
     if frame is None or frame.size == 0:
         return {"working": 0, "idle": 0, "manual_stop": 0, "process_finish": 0, "blobs": []}
 
     h_img, w_img = frame.shape[:2]
     total_px = h_img * w_img
-    min_area = max(8,  int(total_px * 0.000008))
-    max_area = int(total_px * 0.003)
+    min_area = max(8,  int(total_px * 0.000008))   # very small dots
+    max_area = int(total_px * 0.002)               # cap at ~0.2 % of frame
 
     blurred = cv2.GaussianBlur(frame, (5, 5), 0)
     hsv     = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+    v_ch    = hsv[:, :, 2]
     s_ch    = hsv[:, :, 1]
 
     results = {"working": 0, "idle": 0, "manual_stop": 0, "process_finish": 0, "blobs": []}
@@ -166,24 +168,28 @@ def detect_indicator_lights(frame: np.ndarray) -> dict:
             if perim == 0:
                 continue
             circ = 4 * np.pi * area / (perim ** 2)
-            if circ < 0.25:           # floor tape ≈ 0.01; round lights ≥ 0.4
+            if circ < 0.30:
                 continue
 
             xb, yb, bw, bh = cv2.boundingRect(cnt)
             if bh == 0 or not (0.30 <= bw / bh <= 3.0):
                 continue
 
-            # Local saturation contrast — the decisive filter
-            blob_mask = np.zeros(s_ch.shape, dtype=np.uint8)
+            blob_mask = np.zeros(v_ch.shape, dtype=np.uint8)
             cv2.drawContours(blob_mask, [cnt], -1, 255, -1)
 
-            blob_s  = cv2.mean(s_ch, mask=blob_mask)[0]
-            nb_mask = cv2.dilate(blob_mask, _SURR_KERNEL)
-            surr_s  = cv2.mean(s_ch, mask=cv2.bitwise_xor(nb_mask, blob_mask))[0]
+            # Reject near-gray blobs (white reflections, metal panels)
+            if cv2.mean(s_ch, mask=blob_mask)[0] < 40:
+                continue
 
-            # Light on gray surface: blob_s >> surr_s
-            # Fan body: blob_s ≈ surr_s (same object)
-            if blob_s - surr_s < 18:
+            # ── Local brightness contrast ──────────────────────────────────
+            # Indicator LED: blob much brighter than surrounding machine surface
+            # Floor tape: blob brightness ≈ surrounding floor brightness
+            blob_v = cv2.mean(v_ch, mask=blob_mask)[0]
+            nb     = cv2.dilate(blob_mask, _NB_KERNEL)
+            surr_v = cv2.mean(v_ch, mask=cv2.bitwise_xor(nb, blob_mask))[0]
+
+            if blob_v - surr_v < 20:   # must glow brighter than local background
                 continue
 
             (cx, cy), radius = cv2.minEnclosingCircle(cnt)
