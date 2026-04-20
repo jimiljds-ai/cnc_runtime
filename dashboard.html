@@ -57,6 +57,13 @@
         <div class="kpi-label">Manual Stop</div>
       </div>
     </div>
+    <div class="kpi-card kpi-finish">
+      <div class="kpi-icon"><i class="fas fa-check-double"></i></div>
+      <div class="kpi-body">
+        <div class="kpi-count" id="sum-finish">0</div>
+        <div class="kpi-label">Process Finish</div>
+      </div>
+    </div>
     <div class="kpi-card kpi-efficiency">
       <div class="kpi-icon"><i class="fas fa-chart-pie"></i></div>
       <div class="kpi-body">
@@ -124,6 +131,10 @@
           <div class="legend-row">
             <span class="legend-dot" style="background:#ef4444;box-shadow:0 0 8px #ef4444"></span>
             <span>Red circle = <strong>Manual Stop</strong></span>
+          </div>
+          <div class="legend-row">
+            <span class="legend-dot" style="background:#00d4ff;box-shadow:0 0 8px #00d4ff;animation:blink-dot 1s infinite"></span>
+            <span>Cyan blinking = <strong>Process Finish</strong></span>
           </div>
           <div class="legend-note mt-2">
             <i class="fas fa-info-circle me-1 text-warning"></i>

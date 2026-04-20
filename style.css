@@ -239,6 +239,8 @@ html, body {
 .kpi-stop     .kpi-count { color: var(--c-stop); }
 .kpi-off      .kpi-icon { background: rgba(100,116,139,0.15); color: var(--c-off); }
 .kpi-off      .kpi-count { color: var(--c-off); }
+.kpi-finish   .kpi-icon { background: rgba(0,212,255,0.15);   color: #00d4ff; }
+.kpi-finish   .kpi-count { color: #00d4ff; }
 .kpi-efficiency .kpi-icon { background: rgba(56,189,248,0.15); color: var(--c-unknown); }
 .kpi-efficiency .kpi-count { color: var(--c-unknown); }
 
@@ -361,6 +363,7 @@ html, body {
 .pill-working { background: rgba(34,197,94,0.8);  color: #fff; }
 .pill-idle    { background: rgba(245,158,11,0.8); color: #fff; }
 .pill-stop    { background: rgba(239,68,68,0.8);  color: #fff; }
+.pill-finish  { background: rgba(0,212,255,0.8);  color: #fff; }
 
 /* Note text in section header */
 .note-text {
@@ -410,6 +413,7 @@ html, body {
 .mini-pill.pill-working { background: rgba(34,197,94,0.15);  color: var(--c-working); border: 1px solid rgba(34,197,94,0.3); }
 .mini-pill.pill-idle    { background: rgba(245,158,11,0.15); color: var(--c-idle);    border: 1px solid rgba(245,158,11,0.3); }
 .mini-pill.pill-stop    { background: rgba(239,68,68,0.15);  color: var(--c-stop);    border: 1px solid rgba(239,68,68,0.3); }
+.mini-pill.pill-finish  { background: rgba(0,212,255,0.15);  color: #00d4ff;          border: 1px solid rgba(0,212,255,0.3); }
 .pill-label { font-size: 9px; font-weight: 400; opacity: 0.8; }
 
 /* ── Legend ──────────────────────────────────────────────── */

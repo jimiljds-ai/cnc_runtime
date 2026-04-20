@@ -55,8 +55,8 @@ function renderDashboard(data) {
   const cams    = data.cameras || {};
   const totals  = data.totals  || {};
   const connCnt = data.connected_cameras || 0;
-  const total   = (totals.working || 0) + (totals.idle || 0) + (totals.manual_stop || 0);
-  const effPct  = total > 0 ? Math.round((totals.working || 0) / total * 100) : 0;
+  const total   = (totals.working || 0) + (totals.idle || 0) + (totals.manual_stop || 0) + (totals.process_finish || 0);
+  const effPct  = total > 0 ? Math.round(((totals.working || 0) + (totals.process_finish || 0)) / total * 100) : 0;
 
   // Discover channels from API response (dynamic — no hardcoding)
   const apiChannels = Object.keys(cams).map(Number).sort((a, b) => a - b);
@@ -72,9 +72,10 @@ function renderDashboard(data) {
   }
 
   // KPI bar
-  setText("sum-working",    totals.working     || 0);
-  setText("sum-idle",       totals.idle        || 0);
-  setText("sum-stop",       totals.manual_stop || 0);
+  setText("sum-working",    totals.working        || 0);
+  setText("sum-idle",       totals.idle           || 0);
+  setText("sum-stop",       totals.manual_stop    || 0);
+  setText("sum-finish",     totals.process_finish || 0);
   setText("sum-efficiency", total > 0 ? effPct + "%" : "—");
   setText("sum-cams",       `${connCnt}/${data.total_cameras || knownChannels.length}`);
 
@@ -125,9 +126,10 @@ function buildCameraTiles(cams) {
 function cameraTileHTML(ch, camData) {
   const name      = camData ? escHtml(camData.name) : `Channel ${ch}`;
   const connected = camData ? camData.connected : false;
-  const working   = camData ? (camData.working || 0)     : 0;
-  const idle      = camData ? (camData.idle || 0)        : 0;
-  const stopped   = camData ? (camData.manual_stop || 0) : 0;
+  const working   = camData ? (camData.working        || 0) : 0;
+  const idle      = camData ? (camData.idle           || 0) : 0;
+  const stopped   = camData ? (camData.manual_stop    || 0) : 0;
+  const finished  = camData ? (camData.process_finish || 0) : 0;
 
   return `
 <div class="camera-tile ${connected ? "cam-tile-online" : "cam-tile-offline"}" id="tile-ch${ch}">
@@ -148,6 +150,7 @@ function cameraTileHTML(ch, camData) {
       <span class="count-pill pill-working" id="cnt-w-${ch}">${working}</span>
       <span class="count-pill pill-idle"    id="cnt-i-${ch}">${idle}</span>
       <span class="count-pill pill-stop"    id="cnt-s-${ch}">${stopped}</span>
+      <span class="count-pill pill-finish"  id="cnt-f-${ch}">${finished}</span>
     </div>
   </div>
 </div>`;
@@ -172,9 +175,10 @@ function updateCameraTile(ch, camData) {
   const nameEl = document.getElementById(`tilename-ch${ch}`);
   if (nameEl && camData) nameEl.textContent = camData.name || `Channel ${ch}`;
 
-  setText(`cnt-w-${ch}`, camData ? (camData.working || 0)     : 0);
-  setText(`cnt-i-${ch}`, camData ? (camData.idle || 0)        : 0);
-  setText(`cnt-s-${ch}`, camData ? (camData.manual_stop || 0) : 0);
+  setText(`cnt-w-${ch}`, camData ? (camData.working        || 0) : 0);
+  setText(`cnt-i-${ch}`, camData ? (camData.idle           || 0) : 0);
+  setText(`cnt-s-${ch}`, camData ? (camData.manual_stop    || 0) : 0);
+  setText(`cnt-f-${ch}`, camData ? (camData.process_finish || 0) : 0);
 }
 
 // ─── Per-Camera Counts Sidebar ────────────────────────────────────────────────
@@ -196,6 +200,7 @@ function renderPerCamCounts(cams) {
     const i = c ? (c.idle || 0)        : 0;
     const s = c ? (c.manual_stop || 0) : 0;
 
+    const f = c ? (c.process_finish || 0) : 0;
     html += `
 <div class="per-cam-row ${connected ? "" : "per-cam-offline"}">
   <div class="per-cam-name">
@@ -206,6 +211,7 @@ function renderPerCamCounts(cams) {
     <span class="mini-pill pill-working">${w} <span class="pill-label">work</span></span>
     <span class="mini-pill pill-idle">${i} <span class="pill-label">idle</span></span>
     <span class="mini-pill pill-stop">${s} <span class="pill-label">stop</span></span>
+    <span class="mini-pill pill-finish">${f} <span class="pill-label">fin</span></span>
   </div>
 </div>`;
   });

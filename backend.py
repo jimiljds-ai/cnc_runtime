@@ -87,75 +87,102 @@ def rtsp_urls_for_channel(ch: int) -> list:
 # ─── Indicator Light Detection (Blob-based, No Fixed ROI) ────────────────────
 # Indicator lights are small bright saturated spots.
 # Area range is set relative to frame size so it works across resolutions.
+# Indicator lights are small bright saturated LED domes on top of machines.
+# Tighter HSV ranges (high S and V) exclude floor tape, reflections, walls.
 LIGHT_SPECS = {
-    "working": {  # Green light
+    "working": {  # Steady Green = Running
         "ranges": [
-            (np.array([38,  70,  70]), np.array([88, 255, 255])),
+            (np.array([38, 120, 160]), np.array([88, 255, 255])),
         ],
         "color_bgr": (0, 220, 60),
     },
-    "idle": {  # Yellow light
+    "idle": {  # Yellow = Idle
+        # High saturation minimum (≥150) is critical to exclude yellow floor tape
         "ranges": [
-            (np.array([18,  80,  80]), np.array([38, 255, 255])),
+            (np.array([18, 150, 160]), np.array([35, 255, 255])),
         ],
         "color_bgr": (0, 200, 240),
     },
-    "manual_stop": {  # Red light (two hue ranges)
+    "manual_stop": {  # Red = Manual Stop / Alarm
         "ranges": [
-            (np.array([0,  110,  80]), np.array([10, 255, 255])),
-            (np.array([165, 110,  80]), np.array([180, 255, 255])),
+            (np.array([0,  140, 130]), np.array([10, 255, 255])),
+            (np.array([165, 140, 130]), np.array([180, 255, 255])),
         ],
         "color_bgr": (50, 50, 240),
     },
+    "process_finish": {  # Blinking Green = Process Complete (derived in CameraManager)
+        "ranges": [],  # No direct HSV — detected via blink analysis
+        "color_bgr": (255, 210, 0),  # Cyan to distinguish from steady green
+    },
 }
 
-_MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+_MORPH_OPEN_K  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+_MORPH_CLOSE_K = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
 
 def detect_indicator_lights(frame: np.ndarray) -> dict:
     """
-    Scan the full frame for indicator light blobs.
-    Returns {"working": N, "idle": N, "manual_stop": N, "blobs": [...]}
-    blobs is a list of (x, y, radius, state) for drawing circles on stream.
+    Scan the full frame for CNC indicator light blobs.
+    Filters aggressively to only match small, bright, circular LED dome lights.
+    Returns {"working": N, "idle": N, "manual_stop": N, "process_finish": N, "blobs": [...]}
     """
     if frame is None or frame.size == 0:
-        return {"working": 0, "idle": 0, "manual_stop": 0, "blobs": []}
+        return {"working": 0, "idle": 0, "manual_stop": 0, "process_finish": 0, "blobs": []}
 
     h, w = frame.shape[:2]
-    total_px   = h * w
-    min_area   = max(15,  int(total_px * 0.00005))   # ~0.005% of frame
-    max_area   = int(total_px * 0.004)               # ~0.4%  of frame
+    total_px = h * w
+    # Stack lights are small domes — keep a tight size window
+    min_area = max(12, int(total_px * 0.000015))   # ~12 px² floor
+    max_area = int(total_px * 0.0012)              # ≤0.12% of frame — much smaller than before
 
-    # Work on a slightly blurred frame to reduce noise
-    blurred = cv2.GaussianBlur(frame, (3, 3), 0)
-    hsv     = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+    blurred   = cv2.GaussianBlur(frame, (3, 3), 0)
+    hsv       = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+    v_channel = hsv[:, :, 2]  # brightness channel for LED validation
 
-    results = {"working": 0, "idle": 0, "manual_stop": 0, "blobs": []}
+    results = {"working": 0, "idle": 0, "manual_stop": 0, "process_finish": 0, "blobs": []}
 
     for state, spec in LIGHT_SPECS.items():
+        if not spec["ranges"]:
+            continue  # process_finish derived later
+
         mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
         for lo, hi in spec["ranges"]:
             mask = cv2.bitwise_or(mask, cv2.inRange(hsv, lo, hi))
 
-        # Morphological clean-up
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  _MORPH_KERNEL)
-        mask = cv2.dilate(mask, _MORPH_KERNEL, iterations=2)
+        # Open removes single-pixel noise; close fills small holes inside the dome
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  _MORPH_OPEN_K)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _MORPH_CLOSE_K)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if min_area <= area <= max_area:
-                perimeter = cv2.arcLength(cnt, True)
-                if perimeter == 0:
-                    continue
-                circularity = 4 * np.pi * area / (perimeter ** 2)
-                if circularity < 0.08:   # reject very elongated shapes
-                    continue
-                # Get enclosing circle for drawing
-                (cx, cy), radius = cv2.minEnclosingCircle(cnt)
-                results[state] += 1
-                results["blobs"].append((int(cx), int(cy), max(6, int(radius * 2.5)), state))
+            if not (min_area <= area <= max_area):
+                continue
+
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter == 0:
+                continue
+            circularity = 4 * np.pi * area / (perimeter ** 2)
+            if circularity < 0.35:  # stack lights are round — reject elongated shapes
+                continue
+
+            # Aspect ratio: dome lights are close to square
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            aspect = bw / bh if bh > 0 else 0
+            if not (0.35 <= aspect <= 2.8):
+                continue
+
+            # Brightness gate: LED indicator lights are much brighter than floor tape
+            cnt_mask = np.zeros(v_channel.shape, dtype=np.uint8)
+            cv2.drawContours(cnt_mask, [cnt], -1, 255, -1)
+            mean_v = cv2.mean(v_channel, mask=cnt_mask)[0]
+            if mean_v < 155:
+                continue
+
+            (cx, cy), radius = cv2.minEnclosingCircle(cnt)
+            results[state] += 1
+            results["blobs"].append((int(cx), int(cy), max(5, int(radius * 2.0)), state))
 
     return results
 
@@ -202,9 +229,10 @@ class CameraManager:
         self._cap: cv2.VideoCapture = None
         self.running         = False
         self._thread: threading.Thread = None
-        self._detections     = {"working": 0, "idle": 0, "manual_stop": 0, "blobs": []}
+        self._detections     = {"working": 0, "idle": 0, "manual_stop": 0, "process_finish": 0, "blobs": []}
         self._det_lock       = threading.Lock()
         self._history        = deque(maxlen=5000)  # (timestamp, detections)
+        self._green_history  = deque(maxlen=30)    # True/False per frame for blink detection
 
     def _try_connect(self) -> bool:
         for url in rtsp_urls_for_channel(self.channel):
@@ -248,13 +276,33 @@ class CameraManager:
                             self._frame      = frame
                             self.frame_count += 1
                         # Detect lights on this frame
-                        det = detect_indicator_lights(frame)
+                        raw_det = detect_indicator_lights(frame)
+
+                        # Blink detection: track green presence over last 30 frames
+                        self._green_history.append(raw_det["working"] > 0)
+                        effective_det = dict(raw_det)
+                        if len(self._green_history) >= 20:
+                            ratio = sum(self._green_history) / len(self._green_history)
+                            transitions = sum(
+                                1 for i in range(1, len(self._green_history))
+                                if self._green_history[i] != self._green_history[i - 1]
+                            )
+                            if 0.15 <= ratio <= 0.85 and transitions >= 4:
+                                # Blinking green → Process Finish
+                                effective_det["process_finish"] = effective_det["working"]
+                                effective_det["working"] = 0
+                                effective_det["blobs"] = [
+                                    (x, y, r, "process_finish" if s == "working" else s)
+                                    for x, y, r, s in effective_det.get("blobs", [])
+                                ]
+
                         with self._det_lock:
-                            self._detections = det
+                            self._detections = effective_det
                             self._history.append((datetime.now(), {
-                                "working":     det["working"],
-                                "idle":        det["idle"],
-                                "manual_stop": det["manual_stop"],
+                                "working":        effective_det["working"],
+                                "idle":           effective_det["idle"],
+                                "manual_stop":    effective_det["manual_stop"],
+                                "process_finish": effective_det["process_finish"],
                             }))
                     else:
                         logger.warning(f"[ch{self.channel}] read failed — reconnecting")
@@ -307,10 +355,11 @@ class CameraManager:
             "error":         self.connection_error,
             "active_url":    self.active_url,
             "frame_count":   self.frame_count,
-            "working":       det["working"],
-            "idle":          det["idle"],
-            "manual_stop":   det["manual_stop"],
-            "last_updated":  datetime.now().isoformat(),
+            "working":        det["working"],
+            "idle":           det["idle"],
+            "manual_stop":    det["manual_stop"],
+            "process_finish": det.get("process_finish", 0),
+            "last_updated":   datetime.now().isoformat(),
         }
 
     def get_shift_totals(self) -> dict:
@@ -465,9 +514,10 @@ def api_cameras():
     # Aggregate totals across all cameras
     # Note: machines visible in multiple cameras may be counted more than once.
     totals = {
-        "working":     sum(c["working"]     for c in cam_data.values()),
-        "idle":        sum(c["idle"]        for c in cam_data.values()),
-        "manual_stop": sum(c["manual_stop"] for c in cam_data.values()),
+        "working":        sum(c["working"]                  for c in cam_data.values()),
+        "idle":           sum(c["idle"]                     for c in cam_data.values()),
+        "manual_stop":    sum(c["manual_stop"]              for c in cam_data.values()),
+        "process_finish": sum(c.get("process_finish", 0)    for c in cam_data.values()),
     }
     connected_cams = sum(1 for c in cam_data.values() if c["connected"])
 
