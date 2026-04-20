@@ -193,10 +193,14 @@ function updateCameraTile(ch, camData) {
 }
 
 // ─── Per-Camera Counts Sidebar ────────────────────────────────────────────────
+const _STATE_COLOR = {
+  working:"#22c55e", idle:"#f59e0b", manual_stop:"#ef4444",
+  process_finish:"#00d4ff", off:"#4a5a80"
+};
+
 function renderPerCamCounts(cams) {
   const el = document.getElementById("per-cam-counts");
   if (!el) return;
-
   if (knownChannels.length === 0) {
     el.innerHTML = `<div class="text-muted text-center py-3 small">No cameras selected</div>`;
     return;
@@ -207,39 +211,84 @@ function renderPerCamCounts(cams) {
     const c         = cams[String(ch)];
     const name      = c ? escHtml(c.name) : `Channel ${ch}`;
     const connected = c && c.connected;
-    const w = c ? (c.working || 0)     : 0;
-    const i = c ? (c.idle || 0)        : 0;
-    const s = c ? (c.manual_stop || 0) : 0;
+    const machines  = c && c.machine_states && c.machine_states.length > 0
+                      ? c.machine_states : null;
 
-    const f = c ? (c.process_finish || 0) : 0;
-    html += `
-<div class="per-cam-row ${connected ? "" : "per-cam-offline"}">
+    html += `<div class="per-cam-row ${connected ? "" : "per-cam-offline"}">
   <div class="per-cam-name">
     <span class="tile-dot ${connected ? "dot-online" : "dot-offline"}" style="margin-right:6px"></span>
-    ${name}
-  </div>
-  <div class="per-cam-pills">
-    <span class="mini-pill pill-working">${w} <span class="pill-label">work</span></span>
-    <span class="mini-pill pill-idle">${i} <span class="pill-label">idle</span></span>
-    <span class="mini-pill pill-stop">${s} <span class="pill-label">stop</span></span>
-    <span class="mini-pill pill-finish">${f} <span class="pill-label">fin</span></span>
-  </div>
-</div>`;
+    ${name}`;
+    if (c && c.calibrated)
+      html += ` <span style="font-size:9px;color:#00c878;font-weight:700;margin-left:3px">CAL</span>`;
+    html += `</div>`;
+
+    if (machines) {
+      html += `<div class="per-machine-list">`;
+      machines.forEach(m => {
+        const col = _STATE_COLOR[m.state] || "#4a5a80";
+        html += `<div class="per-machine-row">
+          <span class="machine-dot" style="background:${col};box-shadow:0 0 5px ${col}66"></span>
+          <span class="machine-name">${escHtml(m.label)}</span>
+          <span class="machine-dur" style="color:${col}">${fmtDuration(m.duration_sec)}</span>
+        </div>`;
+      });
+      html += `</div>`;
+    } else {
+      const w = c ? (c.working || 0) : 0;
+      const i = c ? (c.idle || 0) : 0;
+      const s = c ? (c.manual_stop || 0) : 0;
+      const f = c ? (c.process_finish || 0) : 0;
+      html += `<div class="per-cam-pills">
+        <span class="mini-pill pill-working">${w} <span class="pill-label">work</span></span>
+        <span class="mini-pill pill-idle">${i} <span class="pill-label">idle</span></span>
+        <span class="mini-pill pill-stop">${s} <span class="pill-label">stop</span></span>
+        <span class="mini-pill pill-finish">${f} <span class="pill-label">fin</span></span>
+      </div>`;
+    }
+    html += `</div>`;
   });
   el.innerHTML = html;
 }
 
 // ─── Alerts ───────────────────────────────────────────────────────────────────
+const IDLE_ALERT_MIN = 30;   // minutes — mirrors backend default
+const STOP_ALERT_MIN = 10;
+
 function detectAlerts(cams) {
   knownChannels.forEach(ch => {
     const c = cams[String(ch)];
-    if (!c || !c.manual_stop) return;
-    const key = `stop-${ch}-${Math.floor(Date.now() / 30000)}`;
-    if (!seenAlerts.has(key)) {
-      seenAlerts.add(key);
-      addAlert(`${c.name}: ${c.manual_stop} machine(s) in Manual Stop`, "high");
-      showToast(`${c.name} — Manual Stop detected!`, "danger");
+    if (!c) return;
+
+    // Camera-level manual stop alert
+    if (c.manual_stop) {
+      const key = `stop-${ch}-${Math.floor(Date.now() / 30000)}`;
+      if (!seenAlerts.has(key)) {
+        seenAlerts.add(key);
+        addAlert(`${c.name}: ${c.manual_stop} machine(s) in Manual Stop`, "high");
+        showToast(`${c.name} — Manual Stop detected!`, "danger");
+      }
     }
+
+    // Per-machine long-idle / long-stop alerts
+    (c.machine_states || []).forEach(m => {
+      const durMin = Math.floor((m.duration_sec || 0) / 60);
+      if (m.state === "idle" && durMin >= IDLE_ALERT_MIN) {
+        const key = `idle-${ch}-${m.label}-${Math.floor(Date.now() / 600000)}`; // 10-min bucket
+        if (!seenAlerts.has(key)) {
+          seenAlerts.add(key);
+          addAlert(`${c.name} / ${m.label}: Idle for ${durMin} min`, "medium");
+          showToast(`${m.label} idle ${durMin} min`, "warning");
+        }
+      }
+      if (m.state === "manual_stop" && durMin >= STOP_ALERT_MIN) {
+        const key = `mstop-${ch}-${m.label}-${Math.floor(Date.now() / 600000)}`;
+        if (!seenAlerts.has(key)) {
+          seenAlerts.add(key);
+          addAlert(`${c.name} / ${m.label}: Stopped for ${durMin} min`, "high");
+          showToast(`${m.label} stopped ${durMin} min!`, "danger");
+        }
+      }
+    });
   });
 }
 
@@ -299,6 +348,12 @@ function showToast(msg, type) {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+function fmtDuration(sec) {
+  sec = Math.round(sec || 0);
+  if (sec < 60)   return sec + "s";
+  if (sec < 3600) return Math.floor(sec / 60) + "m";
+  return Math.floor(sec / 3600) + "h " + Math.floor((sec % 3600) / 60) + "m";
+}
 function setText(id, val) {
   const el = document.getElementById(id);
   if (el) el.textContent = val;

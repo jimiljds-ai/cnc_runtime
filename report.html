@@ -424,6 +424,15 @@ function renderReport(data) {
       <div class="sc-val">${fmtHM(totals.off / machines.length)}</div>
       <div class="sc-label">Avg Off</div>
     </div>
+    ${(() => {
+      const active = totals.working + totals.idle + totals.manual_stop + totals.process_finish;
+      const util = active > 0 ? Math.round(totals.working / active * 100) : null;
+      const col = util === null ? '#4a5a80' : util >= 70 ? '#22c55e' : util >= 40 ? '#f59e0b' : '#ef4444';
+      return `<div class="sum-card" style="border-color:${col}33">
+        <div class="sc-val" style="color:${col}">${util !== null ? util + '%' : '—'}</div>
+        <div class="sc-label">Floor Utilization</div>
+      </div>`;
+    })()}
   </div>
 </div>`;
 
@@ -432,11 +441,20 @@ function renderReport(data) {
     const s = m[summaryKey] || {};
     const total = Object.values(s).reduce((a,b)=>a+b,0) || 1;
     const pct = k => ((s[k]||0) / total * 100).toFixed(1);
-    const todayText = [
-      s.working    ? `W:${fmtHM(s.working)}`    : '',
-      s.idle       ? `I:${fmtHM(s.idle)}`        : '',
-      s.manual_stop? `S:${fmtHM(s.manual_stop)}` : '',
-      s.off        ? `Off:${fmtHM(s.off)}`        : '',
+
+    // Utilization = working / (working + idle + stop + finish)  — excludes "off"
+    const activeTotal = (s.working||0) + (s.idle||0) + (s.manual_stop||0) + (s.process_finish||0);
+    const utilPct = activeTotal > 0 ? Math.round((s.working||0) / activeTotal * 100) : null;
+    const utilColor = utilPct === null ? '#3a4870'
+                    : utilPct >= 70    ? '#22c55e'
+                    : utilPct >= 40    ? '#f59e0b'
+                    : '#ef4444';
+
+    const activityText = [
+      s.working     ? `W:${fmtHM(s.working)}`    : '',
+      s.idle        ? `I:${fmtHM(s.idle)}`        : '',
+      s.manual_stop ? `S:${fmtHM(s.manual_stop)}` : '',
+      s.off         ? `Off:${fmtHM(s.off)}`       : '',
     ].filter(Boolean).join('  ');
 
     return `<tr>
@@ -444,6 +462,10 @@ function renderReport(data) {
       <td><span class="state-badge st-${m.current_state}">${fmtState(m.current_state)}</span></td>
       <td class="duration"><strong>${fmtDuration(m.duration_sec)}</strong><br>
         <span style="font-size:.68rem;color:#3a4870">since ${fmtTime(m.state_since)}</span></td>
+      <td style="font-size:1.1rem;font-weight:700;color:${utilColor};text-align:center">
+        ${utilPct !== null ? utilPct + '%' : '—'}<br>
+        <span style="font-size:.65rem;color:#3a4870;font-weight:400">utilization</span>
+      </td>
       <td>
         <div class="today-bar-wrap">
           <div class="today-bar">
@@ -453,7 +475,7 @@ function renderReport(data) {
             <div class="bar-seg bar-finish"   style="width:${pct('process_finish')}%"></div>
             <div class="bar-seg bar-off"      style="width:${pct('off')}%"></div>
           </div>
-          <div class="today-text">${todayText || '—'}</div>
+          <div class="today-text">${activityText || '—'}</div>
         </div>
       </td>
     </tr>`;
@@ -464,7 +486,7 @@ function renderReport(data) {
   <div class="panel-head">⚡ Live Machine Status</div>
   <table>
     <thead><tr>
-      <th>Machine</th><th>State</th><th>In State For</th><th>Today's Activity</th>
+      <th>Machine</th><th>State</th><th>In State For</th><th>Utilization</th><th>Activity</th>
     </tr></thead>
     <tbody>${tableRows}</tbody>
   </table>

@@ -494,6 +494,7 @@ class CameraManager:
         self._green_history  = deque(maxlen=30)    # True/False per frame for blink detection
         self._machine_trackers:  dict = {}          # label -> MachineStateTracker
         self._anchor_green_hist: dict = {}          # anchor_idx -> deque[bool] per-anchor blink
+        self._last_alert:        dict = {}          # alert_key -> unix timestamp last sent
 
     def _try_connect(self) -> bool:
         for url in rtsp_urls_for_channel(self.channel):
@@ -585,6 +586,34 @@ class CameraManager:
                                 self._machine_trackers[label] = tracker
                             self._machine_trackers[label].update(eff)
 
+                        # ── Long-idle / long-stop machine alerts ────────────
+                        now_ts = time.time()
+                        for lbl, tracker in self._machine_trackers.items():
+                            st  = tracker.current_state
+                            dur = (datetime.now() - tracker.state_since).total_seconds()
+                            thr = None
+                            if st == "idle":
+                                thr = _alert_config["idle_alert_min"] * 60
+                            elif st == "manual_stop":
+                                thr = _alert_config["stop_alert_min"] * 60
+                            if thr and dur > thr:
+                                akey = f"{self.channel}-{lbl}-{st}"
+                                if now_ts - self._last_alert.get(akey, 0) > 600:
+                                    self._last_alert[akey] = now_ts
+                                    mins = round(dur / 60)
+                                    msg  = (f"{self.name} / {lbl}: "
+                                            f"{st.replace('_',' ')} for {mins} min")
+                                    _machine_alert_queue.append({
+                                        "ts":       datetime.now().isoformat(),
+                                        "channel":  self.channel,
+                                        "cam_name": self.name,
+                                        "machine":  lbl,
+                                        "state":    st,
+                                        "dur_min":  mins,
+                                        "message":  msg,
+                                    })
+                                    logger.warning(f"[ALERT] {msg}")
+
                         with self._det_lock:
                             self._detections = effective_det
                             self._history.append((datetime.now(), {
@@ -638,6 +667,15 @@ class CameraManager:
     def get_status(self) -> dict:
         det = self.get_detections()
         ch_anchors = _calibration.get(str(self.channel), [])
+        now = datetime.now()
+        machine_states = [
+            {
+                "label":        t.label,
+                "state":        t.current_state,
+                "duration_sec": round((now - t.state_since).total_seconds()),
+            }
+            for t in self._machine_trackers.values()
+        ]
         return {
             "channel":        self.channel,
             "name":           self.name,
@@ -651,7 +689,8 @@ class CameraManager:
             "process_finish": det.get("process_finish", 0),
             "calibrated":     len(ch_anchors) > 0,
             "anchor_count":   len(ch_anchors),
-            "last_updated":   datetime.now().isoformat(),
+            "machine_states": machine_states,
+            "last_updated":   now.isoformat(),
         }
 
     def get_shift_totals(self) -> dict:
@@ -668,6 +707,13 @@ class CameraManager:
         """Return per-machine state + duration history for this camera."""
         return [t.get_status() for t in self._machine_trackers.values()]
 
+
+# ─── Machine Alert Config + Queue ────────────────────────────────────────────
+_alert_config = {
+    "idle_alert_min": 30,   # alert when a machine is idle longer than this
+    "stop_alert_min": 10,   # alert when a machine is stopped longer than this
+}
+_machine_alert_queue: deque = deque(maxlen=500)
 
 # ─── Global Camera Pool ────────────────────────────────────────────────────────
 cameras: dict = {
@@ -869,6 +915,30 @@ def api_export_csv(channel):
     fname = f"cnc_ch{channel}_{cam.name.replace(' ','_')}_{datetime.now().strftime('%Y%m%d')}.csv"
     return Response(buf.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": f"attachment;filename={fname}"})
+
+
+@app.route("/api/alerts/machine", methods=["GET"])
+def api_machine_alerts():
+    """Return recent machine-level duration alerts (idle/stop too long)."""
+    return jsonify({
+        "alerts": list(_machine_alert_queue),
+        "config": _alert_config,
+    })
+
+
+@app.route("/api/config/alert-thresholds", methods=["GET", "PUT"])
+def api_alert_thresholds():
+    """GET or PUT alert threshold config.
+    PUT body: {"idle_alert_min": 30, "stop_alert_min": 10}
+    """
+    global _alert_config
+    if request.method == "PUT":
+        body = request.get_json(force=True) or {}
+        if "idle_alert_min" in body:
+            _alert_config["idle_alert_min"] = max(1, int(body["idle_alert_min"]))
+        if "stop_alert_min" in body:
+            _alert_config["stop_alert_min"] = max(1, int(body["stop_alert_min"]))
+    return jsonify(_alert_config)
 
 
 # ─── Calibration API ──────────────────────────────────────────────────────────
