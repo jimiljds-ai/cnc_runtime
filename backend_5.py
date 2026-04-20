@@ -172,6 +172,78 @@ def _merge_nearby_blobs(blobs: list, merge_dist: float = 30.0) -> list:
     return merged
 
 
+# ─── Per-Machine State Duration Tracker ──────────────────────────────────────
+class MachineStateTracker:
+    """Tracks state-duration history for one calibrated indicator light (anchor)."""
+
+    STATES = ("working", "idle", "manual_stop", "process_finish", "off")
+
+    def __init__(self, label: str, x_norm: float, y_norm: float):
+        self.label      = label
+        self.x_norm     = x_norm
+        self.y_norm     = y_norm
+        self._lock      = threading.Lock()
+        self.current_state: str      = "off"
+        self.state_since: datetime   = datetime.now()
+        # Each history entry: {state, start, end, duration_sec}
+        self.history: deque = deque(maxlen=2000)
+
+    def update(self, state):
+        """Call once per frame. state = str or None (→ 'off')."""
+        effective = state if state else "off"
+        now = datetime.now()
+        with self._lock:
+            if effective == self.current_state:
+                return
+            duration = (now - self.state_since).total_seconds()
+            if duration >= 2.0:   # ignore sub-second single-frame glitches
+                self.history.append({
+                    "state":        self.current_state,
+                    "start":        self.state_since.isoformat(),
+                    "end":          now.isoformat(),
+                    "duration_sec": round(duration),
+                })
+            self.current_state = effective
+            self.state_since   = now
+
+    def get_status(self) -> dict:
+        with self._lock:
+            now     = datetime.now()
+            elapsed = (now - self.state_since).total_seconds()
+
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            summary = {s: 0.0 for s in self.STATES}
+
+            # Accumulate completed history periods that overlap today
+            for h in self.history:
+                try:
+                    h_start = datetime.fromisoformat(h["start"])
+                    h_end   = datetime.fromisoformat(h["end"])
+                except Exception:
+                    continue
+                if h_end < today_start:
+                    continue
+                overlap = max(0.0, (min(h_end, now) - max(h_start, today_start)).total_seconds())
+                key = h["state"] if h["state"] in summary else "off"
+                summary[key] += overlap
+
+            # Add current ongoing period
+            cur_start = max(self.state_since, today_start)
+            summary[self.current_state if self.current_state in summary else "off"] += \
+                max(0.0, (now - cur_start).total_seconds())
+
+            return {
+                "label":         self.label,
+                "x_norm":        self.x_norm,
+                "y_norm":        self.y_norm,
+                "current_state": self.current_state,
+                "state_since":   self.state_since.isoformat(),
+                "duration_sec":  round(elapsed),
+                "today_summary": {k: round(v) for k, v in summary.items()},
+                "history":       list(self.history)[-500:],
+            }
+
+
 def detect_indicator_lights(frame: np.ndarray, anchors: list = None) -> dict:
     """
     Two-mode detection:
@@ -235,6 +307,7 @@ def detect_indicator_lights(frame: np.ndarray, anchors: list = None) -> dict:
             if hue <= 10 or hue >= 165:     return "manual_stop"
             return None
 
+        per_anchor = []
         for anc in anchors:
             px     = int(anc["x_norm"] * w)
             py     = int(anc["y_norm"] * h)
@@ -243,7 +316,13 @@ def detect_indicator_lights(frame: np.ndarray, anchors: list = None) -> dict:
             if state:
                 results[state] += 1
                 results["blobs"].append((px, py, 18, state))
-
+            per_anchor.append({
+                "label":  anc.get("label", ""),
+                "x_norm": anc["x_norm"],
+                "y_norm": anc["y_norm"],
+                "state":  state,   # None if light is off / unclassified
+            })
+        results["per_anchor"] = per_anchor
         return results
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -369,6 +448,8 @@ class CameraManager:
         self._det_lock       = threading.Lock()
         self._history        = deque(maxlen=5000)  # (timestamp, detections)
         self._green_history  = deque(maxlen=30)    # True/False per frame for blink detection
+        self._machine_trackers:  dict = {}          # label -> MachineStateTracker
+        self._anchor_green_hist: dict = {}          # anchor_idx -> deque[bool] per-anchor blink
 
     def _try_connect(self) -> bool:
         for url in rtsp_urls_for_channel(self.channel):
@@ -434,6 +515,29 @@ class CameraManager:
                                     (x, y, r, "process_finish" if s == "working" else s)
                                     for x, y, r, s in effective_det.get("blobs", [])
                                 ]
+
+                        # ── Per-anchor machine state tracking ──────────────
+                        for idx, ap in enumerate(raw_det.get("per_anchor", [])):
+                            label = ap["label"] or f"Light {idx + 1}"
+                            raw_state = ap["state"]
+
+                            # Per-anchor blink detection (green blinking → process_finish)
+                            if idx not in self._anchor_green_hist:
+                                self._anchor_green_hist[idx] = deque(maxlen=30)
+                            self._anchor_green_hist[idx].append(raw_state == "working")
+                            gh  = self._anchor_green_hist[idx]
+                            eff = raw_state
+                            if raw_state == "working" and len(gh) >= 20:
+                                ratio = sum(gh) / len(gh)
+                                trans = sum(1 for k in range(1, len(gh)) if gh[k] != gh[k - 1])
+                                if 0.10 <= ratio <= 0.95 and trans >= 3:
+                                    eff = "process_finish"
+
+                            if label not in self._machine_trackers:
+                                self._machine_trackers[label] = MachineStateTracker(
+                                    label, ap["x_norm"], ap["y_norm"]
+                                )
+                            self._machine_trackers[label].update(eff)
 
                         with self._det_lock:
                             self._detections = effective_det
@@ -513,6 +617,10 @@ class CameraManager:
             return {"working": 0, "idle": 0, "manual_stop": 0}
         avg = lambda key: round(sum(d[key] for _, d in recent) / len(recent), 1)
         return {"working": avg("working"), "idle": avg("idle"), "manual_stop": avg("manual_stop")}
+
+    def get_machine_report(self) -> list:
+        """Return per-machine state + duration history for this camera."""
+        return [t.get_status() for t in self._machine_trackers.values()]
 
 
 # ─── Global Camera Pool ────────────────────────────────────────────────────────
@@ -653,6 +761,27 @@ def calibrate_page():
     r = send_from_directory(BASE_DIR, "calibrate.html")
     r.headers.update(_NO_CACHE)
     return r
+
+@app.route("/report")
+def report_page():
+    r = send_from_directory(BASE_DIR, "report.html")
+    r.headers.update(_NO_CACHE)
+    return r
+
+@app.route("/api/report/<int:channel>")
+def api_machine_report(channel):
+    """Per-machine state durations and history for a calibrated camera."""
+    cam = cameras.get(channel)
+    if cam is None:
+        return jsonify({"error": "Channel not found"}), 404
+    anchors = _calibration.get(str(channel), [])
+    return jsonify({
+        "channel":   channel,
+        "cam_name":  cam.name,
+        "calibrated": len(anchors) > 0,
+        "machines":  cam.get_machine_report(),
+        "timestamp": datetime.now().isoformat(),
+    })
 
 
 # ─── Calibration API ──────────────────────────────────────────────────────────
