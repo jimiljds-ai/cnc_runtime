@@ -281,6 +281,8 @@ tr:hover td { background: rgba(255,255,255,0.02); }
   </div>
   <div class="nav-links">
     <span class="refresh-info" id="refresh-info">—</span>
+    <button class="nav-btn" id="window-btn" onclick="toggleWindow()" title="Switch between today and last 8-hour shift">📅 Today</button>
+    <button class="nav-btn" id="export-btn" onclick="exportCSV()" title="Download CSV">⬇ CSV</button>
     <button class="nav-btn active" id="auto-refresh-btn" onclick="toggleAutoRefresh()">⟳ Auto</button>
     <a href="/calibrate" class="nav-btn">🎯 Calibrate</a>
     <a href="/" class="nav-btn">← Dashboard</a>
@@ -304,7 +306,9 @@ let calibration = {};
 let activeChannel = null;
 let autoRefresh = true;
 let refreshTimer = null;
-const REFRESH_MS = 5000;
+let summaryWindow = 'today';   // 'today' | 'shift'
+let lastReport    = null;
+const REFRESH_MS  = 5000;
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 async function init() {
@@ -351,14 +355,26 @@ async function loadReport(ch) {
   try {
     const r = await fetch(`/api/report/${ch}`);
     if (!r.ok) throw new Error('HTTP ' + r.status);
-    const data = await r.json();
-    renderReport(data);
+    lastReport = await r.json();
+    renderReport(lastReport);
     document.getElementById('refresh-info').textContent =
       'Updated ' + new Date().toLocaleTimeString('en-GB', {hour12: false});
   } catch(e) {
     document.getElementById('main-area').innerHTML =
       `<div class="no-data">⚠ ${e.message}</div>`;
   }
+}
+
+function toggleWindow() {
+  summaryWindow = summaryWindow === 'today' ? 'shift' : 'today';
+  document.getElementById('window-btn').textContent =
+    summaryWindow === 'today' ? '📅 Today' : '🕗 Shift (8h)';
+  if (lastReport) renderReport(lastReport);
+}
+
+function exportCSV() {
+  if (!activeChannel) return;
+  window.location.href = `/api/export/${activeChannel}.csv`;
 }
 
 // ── Render ────────────────────────────────────────────────────────────────────
@@ -375,17 +391,18 @@ function renderReport(data) {
     return;
   }
 
-  // ── Camera-level summary (sum across all machines today) ──────────────────
+  // ── Camera-level summary (sum across all machines, selected window) ─────────
+  const summaryKey = summaryWindow === 'shift' ? 'shift_summary' : 'today_summary';
+  const windowLabel = summaryWindow === 'shift' ? 'Last 8-Hour Shift' : "Today";
   const totals = { working:0, idle:0, manual_stop:0, process_finish:0, off:0 };
   machines.forEach(m => {
-    const s = m.today_summary || {};
+    const s = m[summaryKey] || {};
     Object.keys(totals).forEach(k => { totals[k] += (s[k] || 0); });
   });
-  const totalSec = Object.values(totals).reduce((a,b)=>a+b,0) || 1;
 
   const summaryHtml = `
 <div>
-  <div class="section-title">Today's Summary — ${data.cam_name} (${machines.length} machines)</div>
+  <div class="section-title">${windowLabel} — ${data.cam_name} (${machines.length} machines)</div>
   <div class="summary-row">
     <div class="sum-card sc-working">
       <div class="sc-val">${fmtHM(totals.working / machines.length)}</div>
@@ -412,7 +429,7 @@ function renderReport(data) {
 
   // ── Live status table ─────────────────────────────────────────────────────
   const tableRows = machines.map((m, idx) => {
-    const s = m.today_summary || {};
+    const s = m[summaryKey] || {};
     const total = Object.values(s).reduce((a,b)=>a+b,0) || 1;
     const pct = k => ((s[k]||0) / total * 100).toFixed(1);
     const todayText = [

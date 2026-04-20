@@ -42,6 +42,7 @@ NVR_PORT     = 554
 # ─── Camera Config Persistence ───────────────────────────────────────────────
 CAMERAS_CONFIG_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cameras.json")
 CALIBRATION_FILE     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration.json")
+HISTORY_FILE         = os.path.join(os.path.dirname(os.path.abspath(__file__)), "machine_history.json")
 
 # ─── Calibration: per-channel anchor points ──────────────────────────────────
 # Structure: { "ch_str": [ {"x_norm": 0.5, "y_norm": 0.3, "label": "machine1", "tol": 60}, ... ] }
@@ -64,6 +65,42 @@ def save_calibration(data: dict):
     logger.info(f"Calibration saved: {sum(len(v) for v in data.values())} anchor points")
 
 _calibration = load_calibration()
+
+# ─── Machine History Persistence ─────────────────────────────────────────────
+def load_machine_history() -> dict:
+    """Load persisted machine state history. Returns {ch_str: {label: saved_data}}."""
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE) as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Could not load machine_history.json: {e}")
+    return {}
+
+def save_machine_history(cams: dict):
+    """Persist all tracker histories so they survive a server restart."""
+    data = {}
+    for ch, cam in cams.items():
+        ch_data = {}
+        for label, tracker in cam._machine_trackers.items():
+            with tracker._lock:
+                ch_data[label] = {
+                    "label":         tracker.label,
+                    "x_norm":        tracker.x_norm,
+                    "y_norm":        tracker.y_norm,
+                    "current_state": tracker.current_state,
+                    "state_since":   tracker.state_since.isoformat(),
+                    "history":       list(tracker.history),
+                }
+        if ch_data:
+            data[str(ch)] = ch_data
+    try:
+        with open(HISTORY_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        logger.warning(f"Could not save machine_history.json: {e}")
+
+_saved_history: dict = load_machine_history()
 
 DEFAULT_CNC_CAMERAS = {
     6: "CNC 2",
@@ -188,6 +225,12 @@ class MachineStateTracker:
         # Each history entry: {state, start, end, duration_sec}
         self.history: deque = deque(maxlen=2000)
 
+    def restore_from_saved(self, saved: dict):
+        """Re-hydrate history from machine_history.json after a restart."""
+        with self._lock:
+            self.history = deque(saved.get("history", []), maxlen=2000)
+            # Keep current_state as "off" — let live frames set it fresh
+
     def update(self, state):
         """Call once per frame. state = str or None (→ 'off')."""
         effective = state if state else "off"
@@ -206,41 +249,42 @@ class MachineStateTracker:
             self.current_state = effective
             self.state_since   = now
 
+    def _compute_summary(self, window_start: datetime, now: datetime) -> dict:
+        """Accumulate seconds in each state for the given time window."""
+        summary = {s: 0.0 for s in self.STATES}
+        for h in self.history:
+            try:
+                h_start = datetime.fromisoformat(h["start"])
+                h_end   = datetime.fromisoformat(h["end"])
+            except Exception:
+                continue
+            if h_end < window_start:
+                continue
+            overlap = max(0.0, (min(h_end, now) - max(h_start, window_start)).total_seconds())
+            key = h["state"] if h["state"] in summary else "off"
+            summary[key] += overlap
+        # Add current ongoing period
+        cur_start = max(self.state_since, window_start)
+        summary[self.current_state if self.current_state in summary else "off"] += \
+            max(0.0, (now - cur_start).total_seconds())
+        return {k: round(v) for k, v in summary.items()}
+
     def get_status(self) -> dict:
         with self._lock:
-            now     = datetime.now()
-            elapsed = (now - self.state_since).total_seconds()
-
+            now         = datetime.now()
+            elapsed     = (now - self.state_since).total_seconds()
             today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            summary = {s: 0.0 for s in self.STATES}
-
-            # Accumulate completed history periods that overlap today
-            for h in self.history:
-                try:
-                    h_start = datetime.fromisoformat(h["start"])
-                    h_end   = datetime.fromisoformat(h["end"])
-                except Exception:
-                    continue
-                if h_end < today_start:
-                    continue
-                overlap = max(0.0, (min(h_end, now) - max(h_start, today_start)).total_seconds())
-                key = h["state"] if h["state"] in summary else "off"
-                summary[key] += overlap
-
-            # Add current ongoing period
-            cur_start = max(self.state_since, today_start)
-            summary[self.current_state if self.current_state in summary else "off"] += \
-                max(0.0, (now - cur_start).total_seconds())
-
+            shift_start = now - timedelta(hours=8)
             return {
-                "label":         self.label,
-                "x_norm":        self.x_norm,
-                "y_norm":        self.y_norm,
-                "current_state": self.current_state,
-                "state_since":   self.state_since.isoformat(),
-                "duration_sec":  round(elapsed),
-                "today_summary": {k: round(v) for k, v in summary.items()},
-                "history":       list(self.history)[-500:],
+                "label":          self.label,
+                "x_norm":         self.x_norm,
+                "y_norm":         self.y_norm,
+                "current_state":  self.current_state,
+                "state_since":    self.state_since.isoformat(),
+                "duration_sec":   round(elapsed),
+                "today_summary":  self._compute_summary(today_start, now),
+                "shift_summary":  self._compute_summary(shift_start, now),
+                "history":        list(self.history)[-500:],
             }
 
 
@@ -534,9 +578,11 @@ class CameraManager:
                                     eff = "process_finish"
 
                             if label not in self._machine_trackers:
-                                self._machine_trackers[label] = MachineStateTracker(
-                                    label, ap["x_norm"], ap["y_norm"]
-                                )
+                                tracker = MachineStateTracker(label, ap["x_norm"], ap["y_norm"])
+                                saved_ch = _saved_history.get(str(self.channel), {})
+                                if label in saved_ch:
+                                    tracker.restore_from_saved(saved_ch[label])
+                                self._machine_trackers[label] = tracker
                             self._machine_trackers[label].update(eff)
 
                         with self._det_lock:
@@ -624,10 +670,20 @@ class CameraManager:
 
 
 # ─── Global Camera Pool ────────────────────────────────────────────────────────
-# Empty dict if not configured yet — setup page will populate it.
 cameras: dict = {
     ch: CameraManager(ch, name) for ch, name in CNC_CAMERAS.items()
 }
+
+# ─── Periodic History Persistence ────────────────────────────────────────────
+import atexit
+
+def _history_saver_loop():
+    while True:
+        time.sleep(60)
+        save_machine_history(cameras)
+
+threading.Thread(target=_history_saver_loop, daemon=True, name="history-saver").start()
+atexit.register(lambda: save_machine_history(cameras))
 
 # ─── Flask App ────────────────────────────────────────────────────────────────
 app     = Flask(__name__, static_folder=".", static_url_path="")
@@ -776,12 +832,43 @@ def api_machine_report(channel):
         return jsonify({"error": "Channel not found"}), 404
     anchors = _calibration.get(str(channel), [])
     return jsonify({
-        "channel":   channel,
-        "cam_name":  cam.name,
+        "channel":    channel,
+        "cam_name":   cam.name,
         "calibrated": len(anchors) > 0,
-        "machines":  cam.get_machine_report(),
-        "timestamp": datetime.now().isoformat(),
+        "machines":   cam.get_machine_report(),
+        "timestamp":  datetime.now().isoformat(),
     })
+
+
+@app.route("/api/export/<int:channel>.csv")
+def api_export_csv(channel):
+    """Download full state-change history for all machines on a channel as CSV."""
+    import io, csv as csv_mod
+    cam = cameras.get(channel)
+    if cam is None:
+        return "Channel not found", 404
+    report = cam.get_machine_report()
+
+    buf = io.StringIO()
+    w   = csv_mod.writer(buf)
+    w.writerow(["Camera", "Machine", "State", "Start", "End", "Duration (s)", "Duration"])
+    for m in report:
+        for h in m["history"]:
+            sec = h["duration_sec"]
+            hrs = sec // 3600; mins = (sec % 3600) // 60; secs = sec % 60
+            fmt = f"{int(hrs)}h {int(mins)}m {int(secs)}s"
+            w.writerow([cam.name, m["label"], h["state"], h["start"], h["end"], sec, fmt])
+        # Current (open) period
+        now = datetime.now().isoformat()
+        sec = m["duration_sec"]
+        hrs = sec // 3600; mins = (sec % 3600) // 60; secs = sec % 60
+        fmt = f"{int(hrs)}h {int(mins)}m {int(secs)}s (ongoing)"
+        w.writerow([cam.name, m["label"], m["current_state"], m["state_since"], now, sec, fmt])
+
+    buf.seek(0)
+    fname = f"cnc_ch{channel}_{cam.name.replace(' ','_')}_{datetime.now().strftime('%Y%m%d')}.csv"
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": f"attachment;filename={fname}"})
 
 
 # ─── Calibration API ──────────────────────────────────────────────────────────
