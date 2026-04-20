@@ -87,26 +87,27 @@ def rtsp_urls_for_channel(ch: int) -> list:
 # ─── Indicator Light Detection (Blob-based, No Fixed ROI) ────────────────────
 # Indicator lights are small bright saturated spots.
 # Area range is set relative to frame size so it works across resolutions.
-# Indicator lights are small bright saturated LED domes on top of machines.
-# Tighter HSV ranges (high S and V) exclude floor tape, reflections, walls.
+# Indicator lights: small saturated LED domes viewed from overhead.
+# RTSP H.264 compression reduces apparent saturation, so keep color ranges relaxed.
+# The PRIMARY filter against floor tape / reflections is CIRCULARITY (tape ≈ 0.01).
 LIGHT_SPECS = {
     "working": {  # Steady Green = Running
         "ranges": [
-            (np.array([38, 120, 160]), np.array([88, 255, 255])),
+            (np.array([38, 70, 100]), np.array([88, 255, 255])),
         ],
         "color_bgr": (0, 220, 60),
     },
     "idle": {  # Yellow = Idle
-        # High saturation minimum (≥150) is critical to exclude yellow floor tape
+        # S≥90 excludes matte floor tape (~S60-80) while still catching LED after compression
         "ranges": [
-            (np.array([18, 150, 160]), np.array([35, 255, 255])),
+            (np.array([18, 90, 110]), np.array([35, 255, 255])),
         ],
         "color_bgr": (0, 200, 240),
     },
     "manual_stop": {  # Red = Manual Stop / Alarm
         "ranges": [
-            (np.array([0,  140, 130]), np.array([10, 255, 255])),
-            (np.array([165, 140, 130]), np.array([180, 255, 255])),
+            (np.array([0,  90,  90]), np.array([10, 255, 255])),
+            (np.array([165, 90,  90]), np.array([180, 255, 255])),
         ],
         "color_bgr": (50, 50, 240),
     },
@@ -131,9 +132,9 @@ def detect_indicator_lights(frame: np.ndarray) -> dict:
 
     h, w = frame.shape[:2]
     total_px = h * w
-    # Stack lights are small domes — keep a tight size window
-    min_area = max(12, int(total_px * 0.000015))   # ~12 px² floor
-    max_area = int(total_px * 0.0012)              # ≤0.12% of frame — much smaller than before
+    # Indicator lights from overhead: small circles, ~15-50px radius
+    min_area = max(10, int(total_px * 0.000010))   # ~10 px² minimum
+    max_area = int(total_px * 0.0020)              # ≤0.20% — tighter than original but not too small
 
     blurred   = cv2.GaussianBlur(frame, (3, 3), 0)
     hsv       = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
@@ -164,20 +165,21 @@ def detect_indicator_lights(frame: np.ndarray) -> dict:
             if perimeter == 0:
                 continue
             circularity = 4 * np.pi * area / (perimeter ** 2)
-            if circularity < 0.35:  # stack lights are round — reject elongated shapes
+            # Floor tape segments have circularity ≈ 0.01–0.08; real light domes ≥ 0.25
+            if circularity < 0.25:
                 continue
 
-            # Aspect ratio: dome lights are close to square
+            # Aspect ratio: dome lights are roughly square
             x, y, bw, bh = cv2.boundingRect(cnt)
             aspect = bw / bh if bh > 0 else 0
-            if not (0.35 <= aspect <= 2.8):
+            if not (0.30 <= aspect <= 3.0):
                 continue
 
-            # Brightness gate: LED indicator lights are much brighter than floor tape
+            # Brightness gate: blob pixels must be reasonably bright (not dark shadow areas)
             cnt_mask = np.zeros(v_channel.shape, dtype=np.uint8)
             cv2.drawContours(cnt_mask, [cnt], -1, 255, -1)
             mean_v = cv2.mean(v_channel, mask=cnt_mask)[0]
-            if mean_v < 155:
+            if mean_v < 100:
                 continue
 
             (cx, cy), radius = cv2.minEnclosingCircle(cnt)
