@@ -40,7 +40,30 @@ NVR_PASSWORD = "Admin@1234"
 NVR_PORT     = 554
 
 # ─── Camera Config Persistence ───────────────────────────────────────────────
-CAMERAS_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cameras.json")
+CAMERAS_CONFIG_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cameras.json")
+CALIBRATION_FILE     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration.json")
+
+# ─── Calibration: per-channel anchor points ──────────────────────────────────
+# Structure: { "ch_str": [ {"x_norm": 0.5, "y_norm": 0.3, "label": "machine1", "tol": 60}, ... ] }
+# x_norm / y_norm are 0.0–1.0 fractions of the frame so they survive resolution changes.
+# tol is the search radius in pixels at actual frame resolution.
+_calibration: dict = {}
+
+def load_calibration() -> dict:
+    if os.path.exists(CALIBRATION_FILE):
+        try:
+            with open(CALIBRATION_FILE) as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Could not load calibration.json: {e}")
+    return {}
+
+def save_calibration(data: dict):
+    with open(CALIBRATION_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+    logger.info(f"Calibration saved: {sum(len(v) for v in data.values())} anchor points")
+
+_calibration = load_calibration()
 
 DEFAULT_CNC_CAMERAS = {
     6: "CNC 2",
@@ -84,30 +107,31 @@ def rtsp_urls_for_channel(ch: int) -> list:
         f"rtsp://{u}:{p}@{h}:{NVR_PORT}/ch{ch:02d}/0",
     ]
 
-# ─── Indicator Light Detection ───────────────────────────────────────────────
-# Physical model:
-#   Indicator lights are SELF-LUMINOUS LEDs → brighter than the machine surface around them.
-#   Floor tape reflects ambient light → same brightness as surrounding floor → no contrast.
-#   Large colored objects (fan, tools) → vary, but usually large (caught by max_area).
-#
-# Filter pipeline:
-#   1. HSV color mask  (wide ranges — RTSP compression degrades saturation)
-#   2. Circularity ≥ 0.30  (tape segments ≈ 0.01; round dome ≥ 0.4)
-#   3. Size limits  (small blob = single indicator dome)
-#   4. Local brightness contrast: blob must be brighter than surrounding area by ≥ 20 V-units
+# ─── Indicator Light Detection (Blob-based, No Fixed ROI) ────────────────────
+# Indicator lights are small bright saturated spots.
+# Area range is set relative to frame size so it works across resolutions.
+# Indicator lights: small saturated LED domes viewed from overhead.
+# RTSP H.264 compression reduces apparent saturation, so keep color ranges relaxed.
+# The PRIMARY filter against floor tape / reflections is CIRCULARITY (tape ≈ 0.01).
 LIGHT_SPECS = {
     "working": {  # Steady Green = Running
-        "ranges": [(np.array([38, 40, 60]), np.array([88, 255, 255]))],
+        "ranges": [
+            (np.array([38, 60, 90]), np.array([88, 255, 255])),
+        ],
         "color_bgr": (0, 220, 60),
     },
-    "idle": {  # Yellow/Amber = Idle
-        "ranges": [(np.array([15, 55, 70]), np.array([38, 255, 255]))],
+    "idle": {  # Yellow = Idle
+        # Yellow LED after RTSP H.264 compression: S can drop to 70–90.
+        # Shape filters (circularity + solidity) are what kill floor tape, NOT S value.
+        "ranges": [
+            (np.array([18, 70, 100]), np.array([35, 255, 255])),
+        ],
         "color_bgr": (0, 200, 240),
     },
-    "manual_stop": {  # Red = Manual Stop
+    "manual_stop": {  # Red = Manual Stop / Alarm
         "ranges": [
-            (np.array([0,  55, 60]), np.array([12, 255, 255])),
-            (np.array([163, 55, 60]), np.array([180, 255, 255])),
+            (np.array([0,   80,  90]), np.array([10, 255, 255])),
+            (np.array([165, 80,  90]), np.array([180, 255, 255])),
         ],
         "color_bgr": (50, 50, 240),
     },
@@ -117,34 +141,118 @@ LIGHT_SPECS = {
     },
 }
 
-_MORPH_OPEN_K  = cv2.getStructuringElement(cv2.MORPH_CROSS,   (3, 3))
-_MORPH_CLOSE_K = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-_NB_KERNEL     = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+_MORPH_OPEN_K  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+_MORPH_CLOSE_K = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))  # larger to merge LED sub-blobs
 
 
-def detect_indicator_lights(frame: np.ndarray) -> dict:
+def _merge_nearby_blobs(blobs: list, merge_dist: float = 30.0) -> list:
     """
-    Detect CNC indicator light blobs.
+    Cluster blobs whose centres are within `merge_dist` pixels of each other.
+    Keeps only the largest blob from each cluster, preventing one LED from
+    being counted as multiple lights.
+    """
+    if not blobs:
+        return blobs
+    used = [False] * len(blobs)
+    merged = []
+    for i, (x1, y1, r1, s1) in enumerate(blobs):
+        if used[i]:
+            continue
+        cluster = [(x1, y1, r1, s1)]
+        used[i] = True
+        for j, (x2, y2, r2, s2) in enumerate(blobs):
+            if used[j] or s2 != s1:
+                continue
+            if ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5 < merge_dist:
+                cluster.append((x2, y2, r2, s2))
+                used[j] = True
+        # Keep the blob with the largest radius from the cluster
+        best = max(cluster, key=lambda b: b[2])
+        merged.append(best)
+    return merged
 
-    The decisive filter is LOCAL BRIGHTNESS CONTRAST:
-      - LED on machine surface → blob V >> surrounding V  (self-luminous)
-      - Floor tape on floor    → blob V ≈ surrounding V  (passive reflection)
-    This cleanly separates lights from tape, cardboard, tools, etc.
+
+def detect_indicator_lights(frame: np.ndarray, anchors: list = None) -> dict:
+    """
+    Two-mode detection:
+
+    CALIBRATED (anchors provided):
+      Directly samples the HSV value at each known anchor position in a small
+      neighbourhood. No blob detection needed — position is ground truth.
+      Classifies colour from the dominant HSV in a patch around each anchor.
+
+    UNCALIBRATED (no anchors):
+      Full-frame blob detection with shape + colour filters.
     """
     if frame is None or frame.size == 0:
         return {"working": 0, "idle": 0, "manual_stop": 0, "process_finish": 0, "blobs": []}
 
-    h_img, w_img = frame.shape[:2]
-    total_px = h_img * w_img
-    min_area = max(8,  int(total_px * 0.000008))   # very small dots
-    max_area = int(total_px * 0.002)               # cap at ~0.2 % of frame
-
-    blurred = cv2.GaussianBlur(frame, (5, 5), 0)
-    hsv     = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
-    v_ch    = hsv[:, :, 2]
-    s_ch    = hsv[:, :, 1]
+    h, w = frame.shape[:2]
+    blurred   = cv2.GaussianBlur(frame, (5, 5), 0)
+    hsv       = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+    v_channel = hsv[:, :, 2]
+    s_channel = hsv[:, :, 1]
 
     results = {"working": 0, "idle": 0, "manual_stop": 0, "process_finish": 0, "blobs": []}
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CALIBRATED MODE — sample HSV patch at each anchor directly
+    # ══════════════════════════════════════════════════════════════════════════
+    if anchors:
+        PATCH = 12   # minimum search radius in pixels
+
+        def classify_patch(px, py, radius=PATCH):
+            """Return state name based on dominant HSV in a patch, or None.
+
+            Uses V×S scoring so we pick the pixel that is both bright AND
+            saturated — i.e. the LED itself, not a white specular glare point.
+            """
+            r = max(PATCH, min(radius, 80))     # clamp to [12, 80] px
+            x1 = max(0, px - r); x2 = min(w, px + r)
+            y1 = max(0, py - r); y2 = min(h, py + r)
+            patch_hsv = hsv[y1:y2, x1:x2]
+            if patch_hsv.size == 0:
+                return None
+
+            patch_v = patch_hsv[:, :, 2]
+            patch_s = patch_hsv[:, :, 1]
+            if int(patch_v.max()) < 80:
+                return None   # too dark — light is off
+
+            # Score = brightness × saturation → finds coloured LED, not white glare
+            score = patch_v.astype(np.float32) * patch_s.astype(np.float32)
+            idx   = np.unravel_index(score.argmax(), score.shape)
+            hue   = int(patch_hsv[idx[0], idx[1], 0])
+            sat   = int(patch_hsv[idx[0], idx[1], 1])
+            val   = int(patch_hsv[idx[0], idx[1], 2])
+
+            # Lowered from 40→30: RTSP H.264 compression degrades saturation
+            if sat < 30 or val < 50:
+                return None
+
+            if 38 <= hue <= 88:             return "working"
+            if 18 <= hue <= 37:             return "idle"
+            if hue <= 10 or hue >= 165:     return "manual_stop"
+            return None
+
+        for anc in anchors:
+            px     = int(anc["x_norm"] * w)
+            py     = int(anc["y_norm"] * h)
+            radius = int(anc.get("tol", PATCH))   # use operator-set tolerance
+            state  = classify_patch(px, py, radius)
+            if state:
+                results[state] += 1
+                results["blobs"].append((px, py, 18, state))
+
+        return results
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # UNCALIBRATED MODE — full-frame blob detection
+    # ══════════════════════════════════════════════════════════════════════════
+    total_px  = h * w
+    min_area  = max(15,  int(total_px * 0.000012))
+    max_area  = int(total_px * 0.00080)
+    v_blur    = cv2.GaussianBlur(v_channel, (21, 21), 0)
 
     for state, spec in LIGHT_SPECS.items():
         if not spec["ranges"]:
@@ -154,8 +262,13 @@ def detect_indicator_lights(frame: np.ndarray) -> dict:
         for lo, hi in spec["ranges"]:
             mask = cv2.bitwise_or(mask, cv2.inRange(hsv, lo, hi))
 
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  _MORPH_OPEN_K)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _MORPH_CLOSE_K)
+        sat_gate = cv2.inRange(s_channel, 60, 255)
+        val_gate = cv2.inRange(v_channel, 90, 255)
+        mask     = cv2.bitwise_and(mask, sat_gate)
+        mask     = cv2.bitwise_and(mask, val_gate)
+
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  _MORPH_OPEN_K,  iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _MORPH_CLOSE_K, iterations=1)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -164,37 +277,48 @@ def detect_indicator_lights(frame: np.ndarray) -> dict:
             if not (min_area <= area <= max_area):
                 continue
 
-            perim = cv2.arcLength(cnt, True)
-            if perim == 0:
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter == 0:
                 continue
-            circ = 4 * np.pi * area / (perim ** 2)
-            if circ < 0.30:
-                continue
-
-            xb, yb, bw, bh = cv2.boundingRect(cnt)
-            if bh == 0 or not (0.30 <= bw / bh <= 3.0):
+            circularity = 4 * np.pi * area / (perimeter ** 2)
+            if circularity < 0.45:
                 continue
 
-            blob_mask = np.zeros(v_ch.shape, dtype=np.uint8)
-            cv2.drawContours(blob_mask, [cnt], -1, 255, -1)
-
-            # Reject near-gray blobs (white reflections, metal panels)
-            if cv2.mean(s_ch, mask=blob_mask)[0] < 40:
+            hull      = cv2.convexHull(cnt)
+            hull_area = cv2.contourArea(hull)
+            solidity  = area / hull_area if hull_area > 0 else 0
+            if solidity < 0.80:
                 continue
 
-            # ── Local brightness contrast ──────────────────────────────────
-            # Indicator LED: blob much brighter than surrounding machine surface
-            # Floor tape: blob brightness ≈ surrounding floor brightness
-            blob_v = cv2.mean(v_ch, mask=blob_mask)[0]
-            nb     = cv2.dilate(blob_mask, _NB_KERNEL)
-            surr_v = cv2.mean(v_ch, mask=cv2.bitwise_xor(nb, blob_mask))[0]
-
-            if blob_v - surr_v < 20:   # must glow brighter than local background
+            (cx_pre, cy_pre), r_pre = cv2.minEnclosingCircle(cnt)
+            x_bb, y_bb, bw_bb, bh_bb = cv2.boundingRect(cnt)
+            bbox_diag_half = ((bw_bb**2 + bh_bb**2) ** 0.5) / 2
+            if r_pre > bbox_diag_half * 1.6:
                 continue
 
-            (cx, cy), radius = cv2.minEnclosingCircle(cnt)
+            aspect = bw_bb / bh_bb if bh_bb > 0 else 0
+            if not (0.50 <= aspect <= 2.0):
+                continue
+
+            ix, iy   = int(cx_pre), int(cy_pre)
+            local_bg = float(v_blur[min(iy, h-1), min(ix, w-1)])
+            raw_v    = float(v_channel[min(iy, h-1), min(ix, w-1)])
+
+            peak_threshold = 15 if state == "idle" else 12
+            if raw_v - local_bg < peak_threshold:
+                continue
+
+            abs_floor = 110 if state == "idle" else 100
+            if raw_v < abs_floor:
+                continue
+
             results[state] += 1
-            results["blobs"].append((int(cx), int(cy), max(5, int(radius * 2.0)), state))
+            results["blobs"].append((ix, iy, max(5, int(r_pre * 2.0)), state))
+
+    merged_blobs = _merge_nearby_blobs(results["blobs"], merge_dist=40.0)
+    for state in ("working", "idle", "manual_stop"):
+        results[state] = sum(1 for _, _, _, s in merged_blobs if s == state)
+    results["blobs"] = merged_blobs
 
     return results
 
@@ -288,7 +412,8 @@ class CameraManager:
                             self._frame      = frame
                             self.frame_count += 1
                         # Detect lights on this frame
-                        raw_det = detect_indicator_lights(frame)
+                        anchors = _calibration.get(str(self.channel), None)
+                        raw_det = detect_indicator_lights(frame, anchors=anchors)
 
                         # Blink detection: track green presence over last 30 frames
                         self._green_history.append(raw_det["working"] > 0)
@@ -299,7 +424,9 @@ class CameraManager:
                                 1 for i in range(1, len(self._green_history))
                                 if self._green_history[i] != self._green_history[i - 1]
                             )
-                            if 0.15 <= ratio <= 0.85 and transitions >= 4:
+                            # Widened ratio window (0.10–0.95) and lowered transition
+                            # threshold (≥3) to tolerate RTSP frame-drop variance.
+                            if 0.10 <= ratio <= 0.95 and transitions >= 3:
                                 # Blinking green → Process Finish
                                 effective_det["process_finish"] = effective_det["working"]
                                 effective_det["working"] = 0
@@ -360,17 +487,20 @@ class CameraManager:
 
     def get_status(self) -> dict:
         det = self.get_detections()
+        ch_anchors = _calibration.get(str(self.channel), [])
         return {
-            "channel":       self.channel,
-            "name":          self.name,
-            "connected":     self.connected,
-            "error":         self.connection_error,
-            "active_url":    self.active_url,
-            "frame_count":   self.frame_count,
+            "channel":        self.channel,
+            "name":           self.name,
+            "connected":      self.connected,
+            "error":          self.connection_error,
+            "active_url":     self.active_url,
+            "frame_count":    self.frame_count,
             "working":        det["working"],
             "idle":           det["idle"],
             "manual_stop":    det["manual_stop"],
             "process_finish": det.get("process_finish", 0),
+            "calibrated":     len(ch_anchors) > 0,
+            "anchor_count":   len(ch_anchors),
             "last_updated":   datetime.now().isoformat(),
         }
 
@@ -516,6 +646,76 @@ def api_save_config():
         "channels": new_channels,
         "count":    len(new_channels),
     })
+
+
+@app.route("/calibrate")
+def calibrate_page():
+    r = send_from_directory(BASE_DIR, "calibrate.html")
+    r.headers.update(_NO_CACHE)
+    return r
+
+
+# ─── Calibration API ──────────────────────────────────────────────────────────
+
+@app.route("/api/calibration", methods=["GET"])
+def api_get_calibration():
+    return jsonify(_calibration)
+
+
+@app.route("/api/calibration/<int:channel>", methods=["POST"])
+def api_save_channel_calibration(channel):
+    """
+    Save calibration anchor points for a channel.
+    Body: {"anchors": [{"x_norm": 0.4, "y_norm": 0.3, "label": "Machine 1", "tol": 60}, ...]}
+    Replaces any existing calibration for this channel.
+    """
+    global _calibration
+    data = request.get_json(force=True) or {}
+    anchors = data.get("anchors", [])
+    _calibration[str(channel)] = anchors
+    save_calibration(_calibration)
+    logger.info(f"[ch{channel}] Calibration updated: {len(anchors)} anchor(s)")
+    return jsonify({"success": True, "channel": channel, "anchors": len(anchors)})
+
+
+@app.route("/api/calibration/<int:channel>", methods=["DELETE"])
+def api_clear_channel_calibration(channel):
+    """Remove calibration for a channel — reverts to full-frame detection."""
+    global _calibration
+    _calibration.pop(str(channel), None)
+    save_calibration(_calibration)
+    return jsonify({"success": True, "channel": channel})
+
+
+@app.route("/api/calibration/snapshot/<int:channel>")
+def api_calibration_snapshot(channel):
+    """
+    Return a full-resolution annotated JPEG snapshot for the calibration UI.
+    Includes the current raw (uncalibrated) blob detections drawn on top
+    so the operator can see what the system is currently detecting.
+    """
+    global _OFFLINE_JPEG
+    if _OFFLINE_JPEG is None:
+        _OFFLINE_JPEG = _make_offline_jpeg()
+
+    cam = cameras.get(channel)
+    if cam is None:
+        return Response(_OFFLINE_JPEG, mimetype="image/jpeg")
+
+    frame = cam.get_frame()
+    if frame is None:
+        return Response(_OFFLINE_JPEG, mimetype="image/jpeg")
+
+    # Run detection WITHOUT calibration so operator sees all raw candidates
+    raw_det = detect_indicator_lights(frame, anchors=None)
+    annotated = annotate_frame(frame, raw_det, cam.name)
+
+    ret, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    if not ret:
+        return Response(_OFFLINE_JPEG, mimetype="image/jpeg")
+
+    return Response(buf.tobytes(), mimetype="image/jpeg",
+                    headers={"Cache-Control": "no-cache"})
 
 
 @app.route("/api/cameras")

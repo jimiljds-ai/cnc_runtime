@@ -130,12 +130,16 @@ function cameraTileHTML(ch, camData) {
   const idle      = camData ? (camData.idle           || 0) : 0;
   const stopped   = camData ? (camData.manual_stop    || 0) : 0;
   const finished  = camData ? (camData.process_finish || 0) : 0;
+  const calBadge  = camData && camData.calibrated
+    ? `<span class="tile-cal-badge cal-on"  title="${camData.anchor_count} light(s) tracked">CAL</span>`
+    : `<span class="tile-cal-badge cal-off" title="Not calibrated — go to /calibrate">UNCAL</span>`;
 
   return `
 <div class="camera-tile ${connected ? "cam-tile-online" : "cam-tile-offline"}" id="tile-ch${ch}">
   <div class="tile-header">
     <span class="tile-dot ${connected ? "dot-online" : "dot-offline"}"></span>
     <span class="tile-name" id="tilename-ch${ch}">${name}</span>
+    <span id="tile-cal-${ch}">${calBadge}</span>
     <span class="tile-ch">CH ${ch}</span>
   </div>
   <div class="tile-feed-wrap">
@@ -174,6 +178,13 @@ function updateCameraTile(ch, camData) {
 
   const nameEl = document.getElementById(`tilename-ch${ch}`);
   if (nameEl && camData) nameEl.textContent = camData.name || `Channel ${ch}`;
+
+  const calWrap = document.getElementById(`tile-cal-${ch}`);
+  if (calWrap && camData) {
+    calWrap.innerHTML = camData.calibrated
+      ? `<span class="tile-cal-badge cal-on"  title="${camData.anchor_count} light(s) tracked">CAL</span>`
+      : `<span class="tile-cal-badge cal-off" title="Not calibrated — go to /calibrate">UNCAL</span>`;
+  }
 
   setText(`cnt-w-${ch}`, camData ? (camData.working        || 0) : 0);
   setText(`cnt-i-${ch}`, camData ? (camData.idle           || 0) : 0);

@@ -322,6 +322,16 @@ html, body {
   font-family: var(--font-mono);
 }
 
+.tile-cal-badge {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .05em;
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.tile-cal-badge.cal-on  { background: rgba(0,200,120,0.15); color: #00c878; border: 1px solid rgba(0,200,120,0.3); }
+.tile-cal-badge.cal-off { background: rgba(245,158,11,0.12); color: #f59e0b; border: 1px solid rgba(245,158,11,0.25); }
+
 .tile-feed-wrap {
   position: relative;
   flex: 1;
