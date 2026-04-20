@@ -361,17 +361,25 @@ def index():
 def setup_page():
     return send_from_directory(BASE_DIR, "setup.html")
 
+_NO_CACHE = {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"}
+
 @app.route("/style.css")
 def serve_css():
-    return send_from_directory(BASE_DIR, "style.css")
+    r = send_from_directory(BASE_DIR, "style.css")
+    r.headers.update(_NO_CACHE)
+    return r
 
 @app.route("/app.js")
 def serve_js():
-    return send_from_directory(BASE_DIR, "app.js")
+    r = send_from_directory(BASE_DIR, "app.js")
+    r.headers.update(_NO_CACHE)
+    return r
 
 @app.route("/setup.js")
 def serve_setup_js():
-    return send_from_directory(BASE_DIR, "setup.js")
+    r = send_from_directory(BASE_DIR, "setup.js")
+    r.headers.update(_NO_CACHE)
+    return r
 
 
 @app.route("/api/scan-snapshot/<int:channel>")
