@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CNC Light Calibration</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: #0d0f1a;
+    color: #e0e4f0;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    min-height: 100vh;
+  }
+
+  header {
+    background: #161928;
+    border-bottom: 1px solid #2a2f4a;
+    padding: 14px 24px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+  header h1 { font-size: 1.2rem; font-weight: 600; color: #a0b4ff; }
+  header p  { font-size: 0.82rem; color: #6070a0; margin-top: 2px; }
+  .back-btn {
+    margin-left: auto;
+    background: #1e2540;
+    border: 1px solid #2a3460;
+    color: #a0b4ff;
+    padding: 7px 16px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.85rem;
+    text-decoration: none;
+  }
+  .back-btn:hover { background: #252d50; }
+
+  .layout {
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    gap: 0;
+    height: calc(100vh - 61px);
+  }
+
+  /* ── Sidebar ── */
+  .sidebar {
+    background: #12152a;
+    border-right: 1px solid #1e2540;
+    overflow-y: auto;
+    padding: 16px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .sidebar h2 { font-size: 0.72rem; text-transform: uppercase; letter-spacing: .08em; color: #4a5480; padding: 0 4px 8px; }
+
+  .cam-btn {
+    background: #1a1f38;
+    border: 1px solid #252d50;
+    border-radius: 8px;
+    padding: 10px 12px;
+    cursor: pointer;
+    transition: all 0.15s;
+    text-align: left;
+  }
+  .cam-btn:hover  { background: #1f2640; border-color: #3a4470; }
+  .cam-btn.active { background: #1e2d60; border-color: #4060d0; }
+  .cam-btn .cam-name  { font-size: 0.88rem; font-weight: 500; }
+  .cam-btn .cam-meta  { font-size: 0.74rem; color: #5a6490; margin-top: 3px; }
+  .cam-btn .cal-badge {
+    display: inline-block;
+    background: #1a4030;
+    color: #40c090;
+    border: 1px solid #206040;
+    border-radius: 4px;
+    font-size: 0.68rem;
+    padding: 1px 6px;
+    margin-top: 5px;
+  }
+  .cam-btn .uncal-badge {
+    display: inline-block;
+    background: #3a2010;
+    color: #c08040;
+    border: 1px solid #604020;
+    border-radius: 4px;
+    font-size: 0.68rem;
+    padding: 1px 6px;
+    margin-top: 5px;
+  }
+
+  /* ── Main canvas area ── */
+  .main {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .toolbar {
+    background: #12152a;
+    border-bottom: 1px solid #1e2540;
+    padding: 10px 20px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .toolbar .cam-title { font-size: 1rem; font-weight: 600; flex: 1; }
+  .toolbar .hint { font-size: 0.78rem; color: #5a6890; }
+
+  .btn {
+    padding: 7px 16px;
+    border-radius: 6px;
+    border: 1px solid;
+    cursor: pointer;
+    font-size: 0.82rem;
+    font-weight: 500;
+    transition: all 0.15s;
+  }
+  .btn-primary { background: #1e3a9e; border-color: #2a50c0; color: #c0d4ff; }
+  .btn-primary:hover { background: #2040aa; }
+  .btn-danger  { background: #4a1010; border-color: #8a2020; color: #ffb0b0; }
+  .btn-danger:hover { background: #581414; }
+  .btn-success { background: #0d4030; border-color: #1a7050; color: #80ffcc; }
+  .btn-success:hover { background: #105040; }
+  .btn-ghost   { background: transparent; border-color: #2a3460; color: #7080b0; }
+  .btn-ghost:hover { background: #1a1f38; }
+
+  .canvas-wrap {
+    flex: 1;
+    overflow: auto;
+    display: flex;
+    align-items: flex-start;
+    justify-content: flex-start;
+    padding: 20px;
+    background: #0a0c18;
+  }
+
+  #canvas-container {
+    position: relative;
+    display: inline-block;
+    cursor: crosshair;
+    border: 2px solid #1e2540;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  #snap { display: block; max-width: 100%; }
+  #overlay { position: absolute; top: 0; left: 0; pointer-events: none; }
+
+  /* ── Anchor list panel ── */
+  .anchor-panel {
+    background: #12152a;
+    border-top: 1px solid #1e2540;
+    padding: 12px 20px;
+    max-height: 200px;
+    overflow-y: auto;
+  }
+  .anchor-panel h3 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: .07em; color: #4a5480; margin-bottom: 8px; }
+  .anchor-list { display: flex; flex-wrap: wrap; gap: 8px; }
+  .anchor-chip {
+    background: #1a2040;
+    border: 1px solid #2a3460;
+    border-radius: 20px;
+    padding: 4px 10px 4px 8px;
+    font-size: 0.78rem;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .anchor-chip .dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .anchor-chip .remove {
+    cursor: pointer;
+    color: #6070a0;
+    font-size: 0.9rem;
+    line-height: 1;
+    margin-left: 2px;
+  }
+  .anchor-chip .remove:hover { color: #ff6060; }
+
+  .empty-state {
+    text-align: center;
+    padding: 60px 20px;
+    color: #3a4470;
+  }
+  .empty-state .icon { font-size: 3rem; margin-bottom: 12px; }
+  .empty-state p { font-size: 0.9rem; }
+
+  .toast {
+    position: fixed;
+    bottom: 24px; right: 24px;
+    background: #0d4030;
+    border: 1px solid #1a7050;
+    color: #80ffcc;
+    padding: 10px 18px;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    opacity: 0;
+    transform: translateY(10px);
+    transition: all 0.3s;
+    z-index: 1000;
+    pointer-events: none;
+  }
+  .toast.show { opacity: 1; transform: translateY(0); }
+  .toast.error { background: #4a1010; border-color: #8a2020; color: #ffb0b0; }
+
+  .loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+    color: #3a4470;
+    font-size: 0.9rem;
+    gap: 10px;
+  }
+  .spinner {
+    width: 20px; height: 20px;
+    border: 2px solid #2a3460;
+    border-top-color: #4060d0;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  #tol-row { display: flex; align-items: center; gap: 8px; font-size: 0.82rem; color: #6070a0; }
+  #tol-range { accent-color: #4060d0; width: 90px; }
+  #tol-val { color: #a0b4ff; font-weight: 600; min-width: 28px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>🎯 Light Calibration</h1>
+    <p>Click on each indicator light in the snapshot — only those positions will be tracked.</p>
+  </div>
+  <a href="/" class="back-btn">← Dashboard</a>
+</header>
+
+<div class="layout">
+  <!-- Sidebar: camera list -->
+  <div class="sidebar">
+    <h2>Cameras</h2>
+    <div id="cam-list">
+      <div class="loading"><div class="spinner"></div> Loading…</div>
+    </div>
+  </div>
+
+  <!-- Main area -->
+  <div class="main">
+    <div class="toolbar" id="toolbar">
+      <span class="cam-title" id="cam-title">Select a camera →</span>
+      <span class="hint" id="hint">Click on the snapshot to mark each indicator light</span>
+    </div>
+
+    <div class="canvas-wrap" id="canvas-wrap">
+      <div class="empty-state">
+        <div class="icon">📷</div>
+        <p>Select a camera from the left panel to begin calibration.</p>
+      </div>
+    </div>
+
+    <div class="anchor-panel" id="anchor-panel" style="display:none">
+      <h3>Marked Lights — <span id="anchor-count">0</span> point(s)
+        <span style="margin-left:12px" id="tol-row">
+          Tolerance: <input type="range" id="tol-range" min="20" max="120" value="60">
+          <span id="tol-val">60</span>px
+        </span>
+      </h3>
+      <div class="anchor-list" id="anchor-list"></div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────────
+let cameras      = {};       // { ch: {channel, name, ...} }
+let calibration  = {};       // { "ch": [{x_norm, y_norm, label, tol}, ...] }
+let activeChannel = null;
+let pendingAnchors = [];     // anchors being edited for current channel
+let imgW = 1, imgH = 1;      // actual rendered image dimensions
+let tolerance = 60;
+
+const STATE_COLORS = {
+  working:        '#00dd44',
+  idle:           '#ffcc00',
+  manual_stop:    '#ff3333',
+  process_finish: '#00ccff',
+  unknown:        '#8899cc',
+};
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+async function init() {
+  const el = document.getElementById('cam-list');
+  try {
+    // Try /api/cameras first (gives live status + counts)
+    // Fall back to /api/config/cameras if that fails
+    let camData = {};
+    try {
+      const r = await fetch('/api/cameras');
+      if (!r.ok) throw new Error('status ' + r.status);
+      const j = await r.json();
+      // /api/cameras returns { cameras: { "16": {...}, ... } }
+      // /api/config/cameras returns { channels: { "16": "CNC 2", ... } }
+      if (j.cameras) {
+        camData = j.cameras;
+      } else if (j.channels) {
+        // Convert channels format → camera-like objects
+        Object.entries(j.channels).forEach(([ch, name]) => {
+          camData[ch] = { channel: parseInt(ch), name, connected: true };
+        });
+      }
+    } catch (e1) {
+      console.warn('/api/cameras failed, trying /api/config/cameras:', e1);
+      const r2 = await fetch('/api/config/cameras');
+      const j2 = await r2.json();
+      Object.entries(j2.channels || {}).forEach(([ch, name]) => {
+        camData[ch] = { channel: parseInt(ch), name, connected: true };
+      });
+    }
+
+    cameras = camData;
+
+    // Load calibration — non-fatal if endpoint missing
+    try {
+      const rc = await fetch('/api/calibration');
+      if (rc.ok) calibration = await rc.json();
+    } catch (e) {
+      console.warn('Calibration endpoint not available yet:', e);
+      calibration = {};
+    }
+
+    renderCamList();
+
+  } catch (err) {
+    el.innerHTML = `<div style="color:#ff6060;font-size:.8rem;padding:8px">
+      ⚠ Could not load cameras.<br><small>${err.message}</small><br>
+      <button onclick="init()" style="margin-top:8px;padding:4px 10px;cursor:pointer">Retry</button>
+    </div>`;
+  }
+}
+
+// ── Sidebar ───────────────────────────────────────────────────────────────────
+function renderCamList() {
+  const el = document.getElementById('cam-list');
+  const chs = Object.keys(cameras);
+  if (!chs.length) {
+    el.innerHTML = '<div style="color:#4a5480;font-size:.8rem;padding:8px">No cameras configured</div>';
+    return;
+  }
+  el.innerHTML = chs.map(ch => {
+    const cam  = cameras[ch];
+    const cal  = calibration[ch];
+    const badge = cal && cal.length
+      ? `<div class="cal-badge">✓ ${cal.length} light${cal.length>1?'s':''} calibrated</div>`
+      : `<div class="uncal-badge">⚠ Not calibrated</div>`;
+    return `<div class="cam-btn ${activeChannel==ch?'active':''}" onclick="selectCamera('${ch}')">
+      <div class="cam-name">${cam.name||'Camera '+ch}</div>
+      <div class="cam-meta">CH ${ch} ${cam.connected?'● Live':'○ Offline'}</div>
+      ${badge}
+    </div>`;
+  }).join('');
+}
+
+// ── Camera Selection ──────────────────────────────────────────────────────────
+async function selectCamera(ch) {
+  activeChannel  = ch;
+  pendingAnchors = (calibration[ch] || []).map(a => ({...a}));
+  tolerance      = 60;
+  document.getElementById('tol-range').value = tolerance;
+  document.getElementById('tol-val').textContent = tolerance;
+
+  renderCamList();
+  document.getElementById('cam-title').textContent = cameras[ch]?.name || 'Camera ' + ch;
+  document.getElementById('anchor-panel').style.display = 'block';
+  renderAnchors();
+
+  // Load snapshot
+  const wrap = document.getElementById('canvas-wrap');
+  wrap.innerHTML = '<div class="loading"><div class="spinner"></div> Loading snapshot…</div>';
+
+  const img = new Image();
+  img.onload = () => {
+    imgW = img.naturalWidth;
+    imgH = img.naturalHeight;
+
+    const container = document.createElement('div');
+    container.id = 'canvas-container';
+
+    const canvas = document.createElement('canvas');
+    canvas.id   = 'overlay';
+    canvas.width  = imgW;
+    canvas.height = imgH;
+    canvas.style.width  = img.style.width  = '100%';
+    canvas.style.height = img.style.height = 'auto';
+
+    img.id = 'snap';
+    container.appendChild(img);
+    container.appendChild(canvas);
+    wrap.innerHTML = '';
+    wrap.appendChild(container);
+
+    container.addEventListener('click', onCanvasClick);
+
+    // Toolbar buttons
+    document.getElementById('toolbar').innerHTML = `
+      <span class="cam-title">${cameras[ch]?.name || 'Camera '+ch}</span>
+      <button class="btn btn-ghost" onclick="refreshSnapshot()">↺ Refresh</button>
+      <button class="btn btn-danger" onclick="clearAnchors()">✕ Clear All</button>
+      <button class="btn btn-success" onclick="saveCalibration()">✔ Save Calibration</button>
+    `;
+
+    drawOverlay();
+  };
+  img.onerror = () => {
+    // Try existing snapshot endpoint as fallback
+    if (!img.src.includes('/api/snapshot/')) {
+      img.src = `/api/snapshot/${ch}?t=${Date.now()}`;
+    } else {
+      wrap.innerHTML = '<div class="empty-state"><div class="icon">📵</div><p>Could not load snapshot — camera may be offline.</p></div>';
+    }
+  };
+  // Try calibration snapshot first (shows raw detections), fall back to regular snapshot
+  img.src = `/api/calibration/snapshot/${ch}?t=${Date.now()}`;
+}
+
+async function refreshSnapshot() {
+  const ch = activeChannel;
+  if (!ch) return;
+  const img = document.getElementById('snap');
+  if (img) img.src = `/api/calibration/snapshot/${ch}?t=${Date.now()}`;
+}
+
+// ── Click handling ────────────────────────────────────────────────────────────
+function onCanvasClick(e) {
+  const container = document.getElementById('canvas-container');
+  const rect      = container.getBoundingClientRect();
+  // Click position relative to rendered image
+  const rx = (e.clientX - rect.left) / rect.width;
+  const ry = (e.clientY - rect.top)  / rect.height;
+
+  const label = `Light ${pendingAnchors.length + 1}`;
+  pendingAnchors.push({ x_norm: rx, y_norm: ry, label, tol: tolerance });
+  renderAnchors();
+  drawOverlay();
+}
+
+// ── Overlay drawing ───────────────────────────────────────────────────────────
+function drawOverlay() {
+  const canvas = document.getElementById('overlay');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  pendingAnchors.forEach((anc, i) => {
+    const px = anc.x_norm * imgW;
+    const py = anc.y_norm * imgH;
+    const r  = anc.tol;
+
+    // Tolerance circle
+    ctx.beginPath();
+    ctx.arc(px, py, r, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(80,160,255,0.5)';
+    ctx.lineWidth   = 1.5;
+    ctx.setLineDash([5, 4]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Centre cross
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth   = 2;
+    ctx.beginPath();
+    ctx.moveTo(px - 10, py); ctx.lineTo(px + 10, py);
+    ctx.moveTo(px, py - 10); ctx.lineTo(px, py + 10);
+    ctx.stroke();
+
+    // Dot
+    ctx.beginPath();
+    ctx.arc(px, py, 5, 0, Math.PI * 2);
+    ctx.fillStyle = '#50a0ff';
+    ctx.fill();
+
+    // Label
+    ctx.font = 'bold 12px Segoe UI, sans-serif';
+    ctx.fillStyle = '#ffffff';
+    ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+    ctx.lineWidth = 3;
+    ctx.strokeText(`${i+1}`, px + 9, py - 9);
+    ctx.fillText(`${i+1}`, px + 9, py - 9);
+  });
+}
+
+// ── Anchor list ───────────────────────────────────────────────────────────────
+function renderAnchors() {
+  document.getElementById('anchor-count').textContent = pendingAnchors.length;
+  const list = document.getElementById('anchor-list');
+  if (!pendingAnchors.length) {
+    list.innerHTML = '<span style="color:#3a4470;font-size:.8rem">No lights marked yet — click on the snapshot above.</span>';
+    return;
+  }
+  list.innerHTML = pendingAnchors.map((a, i) => `
+    <div class="anchor-chip">
+      <div class="dot" style="background:#50a0ff"></div>
+      <span>${a.label}</span>
+      <span style="color:#4a5480">(${Math.round(a.x_norm*100)}%, ${Math.round(a.y_norm*100)}%)</span>
+      <span class="remove" onclick="removeAnchor(${i})">×</span>
+    </div>`).join('');
+}
+
+function removeAnchor(i) {
+  pendingAnchors.splice(i, 1);
+  // Renumber labels
+  pendingAnchors.forEach((a, j) => { a.label = `Light ${j+1}`; });
+  renderAnchors();
+  drawOverlay();
+}
+
+function clearAnchors() {
+  if (!confirm('Clear all marked lights for this camera?')) return;
+  pendingAnchors = [];
+  renderAnchors();
+  drawOverlay();
+}
+
+// ── Tolerance slider ──────────────────────────────────────────────────────────
+document.getElementById('tol-range').addEventListener('input', function() {
+  tolerance = parseInt(this.value);
+  document.getElementById('tol-val').textContent = tolerance;
+  pendingAnchors.forEach(a => { a.tol = tolerance; });
+  drawOverlay();
+});
+
+// ── Save ──────────────────────────────────────────────────────────────────────
+async function saveCalibration() {
+  if (!activeChannel) return;
+  try {
+    const res = await fetch(`/api/calibration/${activeChannel}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ anchors: pendingAnchors }),
+    });
+    if (res.status === 404) {
+      showToast('⚠ Deploy the updated backend.py first — /api/calibration endpoint not found', true);
+      return;
+    }
+    const data = await res.json();
+    if (data.success) {
+      calibration[activeChannel] = [...pendingAnchors];
+      renderCamList();
+      showToast(`✓ Saved ${pendingAnchors.length} light(s) for ${cameras[activeChannel]?.name}`);
+    } else {
+      showToast('Save failed: ' + JSON.stringify(data), true);
+    }
+  } catch(e) {
+    showToast('Network error: ' + e.message, true);
+  }
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+function showToast(msg, err=false) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className   = 'toast show' + (err ? ' error' : '');
+  setTimeout(() => { t.className = 'toast'; }, 3000);
+}
+
+init();
+</script>
+</body>
+</html>
