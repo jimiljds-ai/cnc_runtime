@@ -199,44 +199,47 @@ def detect_indicator_lights(frame: np.ndarray, anchors: list = None) -> dict:
     # CALIBRATED MODE — sample HSV patch at each anchor directly
     # ══════════════════════════════════════════════════════════════════════════
     if anchors:
-        PATCH = 12   # sample radius in pixels around the anchor centre
+        PATCH = 12   # minimum search radius in pixels
 
-        def classify_patch(px, py):
-            """Return state name based on dominant HSV in a patch, or None."""
-            x1 = max(0, px - PATCH); x2 = min(w, px + PATCH)
-            y1 = max(0, py - PATCH); y2 = min(h, py + PATCH)
+        def classify_patch(px, py, radius=PATCH):
+            """Return state name based on dominant HSV in a patch, or None.
+
+            Uses V×S scoring so we pick the pixel that is both bright AND
+            saturated — i.e. the LED itself, not a white specular glare point.
+            """
+            r = max(PATCH, min(radius, 80))     # clamp to [12, 80] px
+            x1 = max(0, px - r); x2 = min(w, px + r)
+            y1 = max(0, py - r); y2 = min(h, py + r)
             patch_hsv = hsv[y1:y2, x1:x2]
             if patch_hsv.size == 0:
                 return None
 
-            # Find the brightest pixel in the patch — that's the LED centre
             patch_v = patch_hsv[:, :, 2]
-            max_v   = int(patch_v.max())
-            if max_v < 80:
+            patch_s = patch_hsv[:, :, 1]
+            if int(patch_v.max()) < 80:
                 return None   # too dark — light is off
 
-            # Get H and S at the brightest point
-            idx     = np.unravel_index(patch_v.argmax(), patch_v.shape)
-            hue     = int(patch_hsv[idx[0], idx[1], 0])
-            sat     = int(patch_hsv[idx[0], idx[1], 1])
+            # Score = brightness × saturation → finds coloured LED, not white glare
+            score = patch_v.astype(np.float32) * patch_s.astype(np.float32)
+            idx   = np.unravel_index(score.argmax(), score.shape)
+            hue   = int(patch_hsv[idx[0], idx[1], 0])
+            sat   = int(patch_hsv[idx[0], idx[1], 1])
+            val   = int(patch_hsv[idx[0], idx[1], 2])
 
-            if sat < 40:
-                return None   # unsaturated — probably white glare or off
+            # Lowered from 40→30: RTSP H.264 compression degrades saturation
+            if sat < 30 or val < 50:
+                return None
 
-            # Classify by hue
-            if 38 <= hue <= 88:
-                return "working"      # green
-            if 18 <= hue <= 37:
-                return "idle"         # yellow
-            if hue <= 10 or hue >= 165:
-                return "manual_stop"  # red
-
-            return None  # unrecognised colour
+            if 38 <= hue <= 88:             return "working"
+            if 18 <= hue <= 37:             return "idle"
+            if hue <= 10 or hue >= 165:     return "manual_stop"
+            return None
 
         for anc in anchors:
-            px = int(anc["x_norm"] * w)
-            py = int(anc["y_norm"] * h)
-            state = classify_patch(px, py)
+            px     = int(anc["x_norm"] * w)
+            py     = int(anc["y_norm"] * h)
+            radius = int(anc.get("tol", PATCH))   # use operator-set tolerance
+            state  = classify_patch(px, py, radius)
             if state:
                 results[state] += 1
                 results["blobs"].append((px, py, 18, state))
@@ -484,17 +487,20 @@ class CameraManager:
 
     def get_status(self) -> dict:
         det = self.get_detections()
+        ch_anchors = _calibration.get(str(self.channel), [])
         return {
-            "channel":       self.channel,
-            "name":          self.name,
-            "connected":     self.connected,
-            "error":         self.connection_error,
-            "active_url":    self.active_url,
-            "frame_count":   self.frame_count,
+            "channel":        self.channel,
+            "name":           self.name,
+            "connected":      self.connected,
+            "error":          self.connection_error,
+            "active_url":     self.active_url,
+            "frame_count":    self.frame_count,
             "working":        det["working"],
             "idle":           det["idle"],
             "manual_stop":    det["manual_stop"],
             "process_finish": det.get("process_finish", 0),
+            "calibrated":     len(ch_anchors) > 0,
+            "anchor_count":   len(ch_anchors),
             "last_updated":   datetime.now().isoformat(),
         }
 

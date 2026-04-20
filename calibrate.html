@@ -230,6 +230,39 @@
   #tol-row { display: flex; align-items: center; gap: 8px; font-size: 0.82rem; color: #6070a0; }
   #tol-range { accent-color: #4060d0; width: 90px; }
   #tol-val { color: #a0b4ff; font-weight: 600; min-width: 28px; }
+
+  /* Hover preview tooltip */
+  #hover-preview {
+    position: fixed;
+    pointer-events: none;
+    background: rgba(10,12,24,0.92);
+    border: 1px solid #2a3460;
+    border-radius: 8px;
+    padding: 6px 12px;
+    font-size: 0.78rem;
+    display: none;
+    z-index: 500;
+    gap: 8px;
+    align-items: center;
+    white-space: nowrap;
+  }
+  #hover-preview.visible { display: flex; }
+  #hover-dot {
+    width: 12px; height: 12px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    border: 1px solid rgba(255,255,255,0.2);
+  }
+  #hover-label { color: #c0d0ff; }
+  #hover-hsv   { color: #4a5480; font-size: 0.72rem; }
+
+  /* State badge on anchor chips */
+  .state-badge {
+    font-size: 0.68rem;
+    padding: 1px 6px;
+    border-radius: 10px;
+    font-weight: 600;
+  }
 </style>
 </head>
 <body>
@@ -277,7 +310,13 @@
   </div>
 </div>
 
+<div id="hover-preview">
+  <div id="hover-dot"></div>
+  <span id="hover-label">—</span>
+  <span id="hover-hsv"></span>
+</div>
 <div class="toast" id="toast"></div>
+<canvas id="pixel-canvas" style="display:none"></canvas>
 
 <script>
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -287,6 +326,7 @@ let activeChannel = null;
 let pendingAnchors = [];     // anchors being edited for current channel
 let imgW = 1, imgH = 1;      // actual rendered image dimensions
 let tolerance = 60;
+let _pixelCtx  = null;       // hidden canvas context for pixel sampling
 
 const STATE_COLORS = {
   working:        '#00dd44',
@@ -295,6 +335,37 @@ const STATE_COLORS = {
   process_finish: '#00ccff',
   unknown:        '#8899cc',
 };
+const STATE_LABELS = {
+  working:        'Working (green)',
+  idle:           'Idle (yellow)',
+  manual_stop:    'Manual Stop (red)',
+  process_finish: 'Process Finish (cyan)',
+};
+
+// ── Client-side HSV classification (mirrors backend logic) ────────────────────
+function rgbToHsv(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  const v = max, d = max - min;
+  const s = max === 0 ? 0 : d / max;
+  let h = 0;
+  if (d > 0) {
+    if      (max === r) h = (g - b) / d + (g < b ? 6 : 0);
+    else if (max === g) h = (b - r) / d + 2;
+    else                h = (r - g) / d + 4;
+    h /= 6;
+  }
+  // Return in OpenCV scale: H 0–180, S 0–255, V 0–255
+  return [h * 180, s * 255, v * 255];
+}
+
+function classifyHsv(h, s, v) {
+  if (v < 80 || s < 30) return null;
+  if (h >= 38 && h <= 88)            return 'working';
+  if (h >= 18 && h <= 37)            return 'idle';
+  if (h <= 10  || h >= 165)          return 'manual_stop';
+  return null;
+}
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 async function init() {
@@ -407,7 +478,18 @@ async function selectCamera(ch) {
     wrap.innerHTML = '';
     wrap.appendChild(container);
 
-    container.addEventListener('click', onCanvasClick);
+    // Seed hidden pixel-reading canvas from this image
+    const pc = document.getElementById('pixel-canvas');
+    pc.width  = imgW;
+    pc.height = imgH;
+    _pixelCtx = pc.getContext('2d');
+    _pixelCtx.drawImage(img, 0, 0);
+
+    container.addEventListener('click',     onCanvasClick);
+    container.addEventListener('mousemove', onCanvasHover);
+    container.addEventListener('mouseleave', () => {
+      document.getElementById('hover-preview').classList.remove('visible');
+    });
 
     // Toolbar buttons
     document.getElementById('toolbar').innerHTML = `
@@ -435,7 +517,60 @@ async function refreshSnapshot() {
   const ch = activeChannel;
   if (!ch) return;
   const img = document.getElementById('snap');
-  if (img) img.src = `/api/calibration/snapshot/${ch}?t=${Date.now()}`;
+  if (!img) return;
+  img.onload = () => {
+    if (_pixelCtx) {
+      const pc = document.getElementById('pixel-canvas');
+      pc.width  = img.naturalWidth;
+      pc.height = img.naturalHeight;
+      _pixelCtx = pc.getContext('2d');
+      _pixelCtx.drawImage(img, 0, 0);
+    }
+  };
+  img.src = `/api/calibration/snapshot/${ch}?t=${Date.now()}`;
+}
+
+// ── Hover preview ─────────────────────────────────────────────────────────────
+function onCanvasHover(e) {
+  if (!_pixelCtx) return;
+  const container = document.getElementById('canvas-container');
+  const rect = container.getBoundingClientRect();
+  const rx = (e.clientX - rect.left) / rect.width;
+  const ry = (e.clientY - rect.top)  / rect.height;
+  const px = Math.round(rx * imgW);
+  const py = Math.round(ry * imgH);
+
+  let r = 0, g = 0, b = 0;
+  try {
+    // Sample a small 5×5 patch and average, matching backend GaussianBlur
+    let rSum = 0, gSum = 0, bSum = 0, n = 0;
+    for (let dy = -2; dy <= 2; dy++) {
+      for (let dx = -2; dx <= 2; dx++) {
+        const d = _pixelCtx.getImageData(
+          Math.max(0, px + dx), Math.max(0, py + dy), 1, 1
+        ).data;
+        rSum += d[0]; gSum += d[1]; bSum += d[2]; n++;
+      }
+    }
+    r = rSum / n; g = gSum / n; b = bSum / n;
+  } catch (_) { return; }
+
+  const [h, s, v] = rgbToHsv(r, g, b);
+  const state = classifyHsv(h, s, v);
+
+  const prev  = document.getElementById('hover-preview');
+  const dot   = document.getElementById('hover-dot');
+  const label = document.getElementById('hover-label');
+  const hsvEl = document.getElementById('hover-hsv');
+
+  dot.style.background = state ? STATE_COLORS[state] : 'rgba(255,255,255,0.1)';
+  label.textContent    = state ? STATE_LABELS[state] : 'No light detected';
+  label.style.color    = state ? STATE_COLORS[state] : '#4a5480';
+  hsvEl.textContent    = `H:${Math.round(h)} S:${Math.round(s)} V:${Math.round(v)}`;
+
+  prev.classList.add('visible');
+  prev.style.left = (e.clientX + 16) + 'px';
+  prev.style.top  = (e.clientY - 10) + 'px';
 }
 
 // ── Click handling ────────────────────────────────────────────────────────────
@@ -498,6 +633,28 @@ function drawOverlay() {
 }
 
 // ── Anchor list ───────────────────────────────────────────────────────────────
+function sampleStateAtAnchor(a) {
+  if (!_pixelCtx) return null;
+  const px = Math.round(a.x_norm * imgW);
+  const py = Math.round(a.y_norm * imgH);
+  const rad = Math.max(4, Math.min(Math.round((a.tol || 60) * imgW / (imgW || 1)), 20));
+  let rS = 0, gS = 0, bS = 0, n = 0;
+  for (let dy = -rad; dy <= rad; dy += 2) {
+    for (let dx = -rad; dx <= rad; dx += 2) {
+      if (dx*dx + dy*dy > rad*rad) continue;
+      try {
+        const d = _pixelCtx.getImageData(
+          Math.max(0, px+dx), Math.max(0, py+dy), 1, 1
+        ).data;
+        rS += d[0]; gS += d[1]; bS += d[2]; n++;
+      } catch(_) {}
+    }
+  }
+  if (!n) return null;
+  const [h, s, v] = rgbToHsv(rS/n, gS/n, bS/n);
+  return classifyHsv(h, s, v);
+}
+
 function renderAnchors() {
   document.getElementById('anchor-count').textContent = pendingAnchors.length;
   const list = document.getElementById('anchor-list');
@@ -505,13 +662,20 @@ function renderAnchors() {
     list.innerHTML = '<span style="color:#3a4470;font-size:.8rem">No lights marked yet — click on the snapshot above.</span>';
     return;
   }
-  list.innerHTML = pendingAnchors.map((a, i) => `
+  list.innerHTML = pendingAnchors.map((a, i) => {
+    const state = sampleStateAtAnchor(a);
+    const badgeHtml = state
+      ? `<span class="state-badge" style="background:${STATE_COLORS[state]}22;color:${STATE_COLORS[state]};border:1px solid ${STATE_COLORS[state]}44">${STATE_LABELS[state].split(' ')[0]}</span>`
+      : `<span class="state-badge" style="background:#2a2a4a;color:#4a5480;border:1px solid #2a3460">Off / ?</span>`;
+    return `
     <div class="anchor-chip">
-      <div class="dot" style="background:#50a0ff"></div>
+      <div class="dot" style="background:${state ? STATE_COLORS[state] : '#50a0ff'}"></div>
       <span>${a.label}</span>
+      ${badgeHtml}
       <span style="color:#4a5480">(${Math.round(a.x_norm*100)}%, ${Math.round(a.y_norm*100)}%)</span>
       <span class="remove" onclick="removeAnchor(${i})">×</span>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
 
 function removeAnchor(i) {
