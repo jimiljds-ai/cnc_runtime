@@ -231,6 +231,17 @@
   #tol-range { accent-color: #4060d0; width: 90px; }
   #tol-val { color: #a0b4ff; font-weight: 600; min-width: 28px; }
 
+  .machine-select {
+    background: #1a2040;
+    border: 1px solid #3050c0;
+    color: #a0c0ff;
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 0.82rem;
+    cursor: pointer;
+  }
+  .machine-select option:disabled { color: #3a4870; }
+
   /* Hover preview tooltip */
   #hover-preview {
     position: fixed;
@@ -494,11 +505,17 @@ async function selectCamera(ch) {
     // Toolbar buttons
     document.getElementById('toolbar').innerHTML = `
       <span class="cam-title">${cameras[ch]?.name || 'Camera '+ch}</span>
+      <label style="font-size:.8rem;color:#7090c0;display:flex;align-items:center;gap:6px">
+        Mark as:
+        <select id="machine-select" class="machine-select" title="Machine number to assign on next click">
+          ${Array.from({length:10},(_,i)=>`<option value="${i+1}">Machine ${i+1}</option>`).join('')}
+        </select>
+      </label>
       <button class="btn btn-ghost" onclick="refreshSnapshot()">↺ Refresh</button>
       <button class="btn btn-danger" onclick="clearAnchors()">✕ Clear All</button>
       <button class="btn btn-success" onclick="saveCalibration()">✔ Save Calibration</button>
     `;
-
+    updateMachineSelect();
     drawOverlay();
   };
   img.onerror = () => {
@@ -573,16 +590,39 @@ function onCanvasHover(e) {
   prev.style.top  = (e.clientY - 10) + 'px';
 }
 
+// ── Machine select helpers ────────────────────────────────────────────────────
+function updateMachineSelect() {
+  const sel = document.getElementById('machine-select');
+  if (!sel) return;
+  const used = new Set(pendingAnchors.map(a => a.label));
+  Array.from(sel.options).forEach(opt => {
+    const lbl = `Machine ${opt.value}`;
+    opt.text     = used.has(lbl) ? `Machine ${opt.value} ✓` : `Machine ${opt.value}`;
+    opt.disabled = used.has(lbl);
+  });
+  // Advance to first unused
+  const first = Array.from(sel.options).find(o => !o.disabled);
+  if (first) sel.value = first.value;
+}
+
 // ── Click handling ────────────────────────────────────────────────────────────
 function onCanvasClick(e) {
+  const sel   = document.getElementById('machine-select');
+  const num   = sel ? sel.value : (pendingAnchors.length + 1);
+  const label = `Machine ${num}`;
+
+  if (pendingAnchors.some(a => a.label === label)) {
+    showToast(`${label} already marked — remove it first or pick another number`, true);
+    return;
+  }
+
   const container = document.getElementById('canvas-container');
   const rect      = container.getBoundingClientRect();
-  // Click position relative to rendered image
   const rx = (e.clientX - rect.left) / rect.width;
   const ry = (e.clientY - rect.top)  / rect.height;
 
-  const label = `Light ${pendingAnchors.length + 1}`;
   pendingAnchors.push({ x_norm: rx, y_norm: ry, label, tol: tolerance });
+  updateMachineSelect();
   renderAnchors();
   drawOverlay();
 }
@@ -622,13 +662,15 @@ function drawOverlay() {
     ctx.fillStyle = '#50a0ff';
     ctx.fill();
 
-    // Label
-    ctx.font = 'bold 12px Segoe UI, sans-serif';
+    // Label — show machine number extracted from "Machine N"
+    const numMatch = anc.label.match(/\d+/);
+    const dispNum  = numMatch ? numMatch[0] : (i + 1);
+    ctx.font = 'bold 13px Segoe UI, sans-serif';
     ctx.fillStyle = '#ffffff';
-    ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+    ctx.strokeStyle = 'rgba(0,0,0,0.8)';
     ctx.lineWidth = 3;
-    ctx.strokeText(`${i+1}`, px + 9, py - 9);
-    ctx.fillText(`${i+1}`, px + 9, py - 9);
+    ctx.strokeText(`M${dispNum}`, px + 9, py - 9);
+    ctx.fillText(`M${dispNum}`, px + 9, py - 9);
   });
 }
 
@@ -680,8 +722,8 @@ function renderAnchors() {
 
 function removeAnchor(i) {
   pendingAnchors.splice(i, 1);
-  // Renumber labels
-  pendingAnchors.forEach((a, j) => { a.label = `Light ${j+1}`; });
+  // Machine labels stay unchanged (M3 stays M3, just removed from list)
+  updateMachineSelect();
   renderAnchors();
   drawOverlay();
 }

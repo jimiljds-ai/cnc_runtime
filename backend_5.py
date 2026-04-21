@@ -917,6 +917,46 @@ def api_export_csv(channel):
                     headers={"Content-Disposition": f"attachment;filename={fname}"})
 
 
+@app.route("/api/machines")
+def api_all_machines():
+    """
+    Aggregate machine states across all cameras, keyed by machine label.
+    If the same machine is visible from multiple cameras, prefer the non-off
+    reading (i.e. when one camera confirms the machine is active).
+    Returns machines sorted by numeric suffix: Machine 1, Machine 2, …
+    """
+    import re as _re
+    combined: dict = {}
+    for ch, cam in cameras.items():
+        for tracker in cam._machine_trackers.values():
+            lbl = tracker.label
+            now = datetime.now()
+            dur = round((now - tracker.state_since).total_seconds())
+            entry = {
+                "label":        lbl,
+                "state":        tracker.current_state,
+                "duration_sec": dur,
+                "camera":       cam.name,
+                "channel":      ch,
+            }
+            if lbl not in combined:
+                combined[lbl] = entry
+            else:
+                # Prefer any active state over "off"
+                if combined[lbl]["state"] == "off" and tracker.current_state != "off":
+                    combined[lbl] = entry
+
+    def _num(label):
+        m = _re.search(r'\d+', label)
+        return int(m.group()) if m else 9999
+
+    sorted_machines = sorted(combined.values(), key=lambda m: _num(m["label"]))
+    return jsonify({
+        "machines":  sorted_machines,
+        "timestamp": datetime.now().isoformat(),
+    })
+
+
 @app.route("/api/alerts/machine", methods=["GET"])
 def api_machine_alerts():
     """Return recent machine-level duration alerts (idle/stop too long)."""

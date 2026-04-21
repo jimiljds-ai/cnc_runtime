@@ -39,15 +39,43 @@ function startClock() {
 // ─── Main Poll Tick ───────────────────────────────────────────────────────────
 async function tick() {
   try {
-    const res = await fetch(`${API_BASE}/api/cameras`, { cache: "no-store" });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
+    const [camRes, machRes] = await Promise.all([
+      fetch(`${API_BASE}/api/cameras`,  { cache: "no-store" }),
+      fetch(`${API_BASE}/api/machines`, { cache: "no-store" }),
+    ]);
+    if (!camRes.ok) throw new Error(`HTTP ${camRes.status}`);
+    const data     = await camRes.json();
+    const machData = machRes.ok ? await machRes.json() : null;
     renderDashboard(data);
+    if (machData) renderAllMachines(machData.machines || []);
   } catch (err) {
     console.warn("Poll failed:", err);
     document.getElementById("last-refresh").textContent = "Connection error — retrying…";
     updateCamStatus(0, knownChannels.length || "?");
   }
+}
+
+// ─── All Machines Panel ───────────────────────────────────────────────────────
+function renderAllMachines(machines) {
+  const el = document.getElementById("all-machines-panel");
+  if (!el) return;
+  if (!machines.length) {
+    el.innerHTML = `<div class="text-muted text-center py-3 small">
+      No calibrated machines yet.<br>
+      <a href="/calibrate" style="color:#3060c0">Calibrate →</a></div>`;
+    return;
+  }
+  el.innerHTML = machines.map(m => {
+    const col = _STATE_COLOR[m.state] || "#4a5a80";
+    const stateLabel = { working:"Working", idle:"Idle", manual_stop:"Stop",
+                         process_finish:"Finish", off:"Off" }[m.state] || m.state;
+    return `<div class="per-machine-row" style="padding:4px 2px;border-bottom:1px solid rgba(255,255,255,0.04)">
+      <span class="machine-dot" style="background:${col};box-shadow:0 0 5px ${col}66;width:8px;height:8px"></span>
+      <span class="machine-name" style="font-size:12px;font-weight:600;color:#c0d0f0">${escHtml(m.label)}</span>
+      <span style="font-size:10px;color:${col};font-weight:700;margin-left:auto">${stateLabel}</span>
+      <span class="machine-dur" style="color:#4a5a80;min-width:36px;text-align:right">${fmtDuration(m.duration_sec)}</span>
+    </div>`;
+  }).join("");
 }
 
 // ─── Render Dashboard ─────────────────────────────────────────────────────────
@@ -223,8 +251,13 @@ function renderPerCamCounts(cams) {
     html += `</div>`;
 
     if (machines) {
+      const sorted = [...machines].sort((a, b) => {
+        const na = parseInt((a.label.match(/\d+/)||[9999])[0]);
+        const nb = parseInt((b.label.match(/\d+/)||[9999])[0]);
+        return na - nb;
+      });
       html += `<div class="per-machine-list">`;
-      machines.forEach(m => {
+      sorted.forEach(m => {
         const col = _STATE_COLOR[m.state] || "#4a5a80";
         html += `<div class="per-machine-row">
           <span class="machine-dot" style="background:${col};box-shadow:0 0 5px ${col}66"></span>

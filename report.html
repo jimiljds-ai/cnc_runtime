@@ -292,6 +292,10 @@ tr:hover td { background: rgba(255,255,255,0.02); }
 <div class="layout">
   <div class="sidebar">
     <div class="sidebar-label">Cameras</div>
+    <div class="cam-btn active" id="btn-all" onclick="selectAllMachines()" style="margin-bottom:4px">
+      <div class="cam-name">🏭 All Machines</div>
+      <div class="cam-meta">Cross-camera view</div>
+    </div>
     <div id="cam-list"><div class="spinner"></div></div>
   </div>
 
@@ -319,10 +323,8 @@ async function init() {
     const rc = await fetch('/api/calibration');
     if (rc.ok) calibration = await rc.json();
     renderCamList();
-    // Auto-select first calibrated camera
-    const first = Object.keys(cameras).find(ch => calibration[ch]?.length > 0)
-                  || Object.keys(cameras)[0];
-    if (first) selectCamera(first);
+    // Default to All Machines view
+    selectAllMachines();
   } catch(e) {
     document.getElementById('cam-list').innerHTML =
       `<div style="color:#ff6060;font-size:.8rem;padding:8px">⚠ ${e.message}</div>`;
@@ -344,10 +346,80 @@ function renderCamList() {
 
 async function selectCamera(ch) {
   activeChannel = ch;
+  document.getElementById('btn-all').classList.remove('active');
   renderCamList();
   clearInterval(refreshTimer);
   await loadReport(ch);
   if (autoRefresh) refreshTimer = setInterval(() => loadReport(ch), REFRESH_MS);
+}
+
+async function selectAllMachines() {
+  activeChannel = null;
+  document.getElementById('btn-all').classList.add('active');
+  document.querySelectorAll('.cam-btn:not(#btn-all)').forEach(b => b.classList.remove('active'));
+  clearInterval(refreshTimer);
+  await loadAllMachines();
+  if (autoRefresh) refreshTimer = setInterval(loadAllMachines, REFRESH_MS);
+}
+
+async function loadAllMachines() {
+  try {
+    const r = await fetch('/api/machines');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    renderAllMachinesReport(data.machines || []);
+    document.getElementById('refresh-info').textContent =
+      'Updated ' + new Date().toLocaleTimeString('en-GB', {hour12:false});
+  } catch(e) {
+    document.getElementById('main-area').innerHTML = `<div class="no-data">⚠ ${e.message}</div>`;
+  }
+}
+
+function renderAllMachinesReport(machines) {
+  const area = document.getElementById('main-area');
+  if (!machines.length) {
+    area.innerHTML = `<div class="no-data">No calibrated machines found.<br>
+      <a href="/calibrate" style="color:#3060d0">Go to Calibrate →</a></div>`;
+    return;
+  }
+
+  const STATE_COLORS_R = { working:'#22c55e', idle:'#f59e0b', manual_stop:'#ef4444',
+                           process_finish:'#00d4ff', off:'#4a5a80' };
+
+  const rows = machines.map(m => {
+    const col = STATE_COLORS_R[m.state] || '#4a5a80';
+    return `<tr>
+      <td><strong>${escHtml(m.label)}</strong></td>
+      <td><span class="state-badge st-${m.state}">${fmtState(m.state)}</span></td>
+      <td class="duration"><strong>${fmtDuration(m.duration_sec)}</strong></td>
+      <td style="color:#6070a0;font-size:.8rem">${escHtml(m.camera)} · CH ${m.channel}</td>
+    </tr>`;
+  }).join('');
+
+  const working  = machines.filter(m => m.state === 'working').length;
+  const idle     = machines.filter(m => m.state === 'idle').length;
+  const stopped  = machines.filter(m => m.state === 'manual_stop').length;
+  const finish   = machines.filter(m => m.state === 'process_finish').length;
+  const off      = machines.filter(m => m.state === 'off').length;
+
+  area.innerHTML = `
+<div>
+  <div class="section-title">All Machines — Factory Floor Overview</div>
+  <div class="summary-row">
+    <div class="sum-card sc-working"><div class="sc-val">${working}</div><div class="sc-label">Working</div></div>
+    <div class="sum-card sc-idle"><div class="sc-val">${idle}</div><div class="sc-label">Idle</div></div>
+    <div class="sum-card sc-stop"><div class="sc-val">${stopped}</div><div class="sc-label">Stopped</div></div>
+    <div class="sum-card sc-finish"><div class="sc-val">${finish}</div><div class="sc-label">Finished</div></div>
+    <div class="sum-card sc-off"><div class="sc-val">${off}</div><div class="sc-label">Off / Unknown</div></div>
+  </div>
+</div>
+<div class="panel">
+  <div class="panel-head">🏭 Machine Status — All ${machines.length} Machines</div>
+  <table>
+    <thead><tr><th>Machine</th><th>State</th><th>Duration</th><th>Camera</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+</div>`;
 }
 
 async function loadReport(ch) {
